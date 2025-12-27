@@ -1,0 +1,23 @@
+[package]
+name = "roulette_table"
+version = "0.1.0"
+description = "Provably-fair European Roulette table (USDC) with ORAO VRF + GOV control"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "roulette_table"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+
+# ORAO VRF CPI (Classic VRF)
+orao-solana-vrf = { version = "0.6.1", default-features = false, features = ["cpi"] }

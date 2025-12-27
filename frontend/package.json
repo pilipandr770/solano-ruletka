@@ -1,0 +1,22 @@
+{
+  "name": "roulette-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/spl-token": "^0.3.11",
+    "@solana/web3.js": "^1.78.0",
+    "next": "13.4.10",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "roulette_table": "file:.."
+  },
+  "devDependencies": {
+    "@types/react": "19.2.7"
+  }
+}

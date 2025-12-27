@@ -1,0 +1,160 @@
+{
+  "version": "0.1.0",
+  "name": "roulette_table",
+  "instructions": [
+    {
+      "name": "createTable",
+      "accounts": [
+        {"name":"creator","isMut":true,"isSigner":true},
+        {"name":"usdcMint","isMut":false,"isSigner":false},
+        {"name":"govMint","isMut":false,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"controlVaultGov","isMut":true,"isSigner":false},
+        {"name":"systemProgram","isMut":false,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false},
+        {"name":"rent","isMut":false,"isSigner":false}
+      ],
+      "args": [
+        {"name":"seed","type":"u64"},
+        {"name":"mode","type":{"defined":"TableMode"}},
+        {"name":"minBet","type":"u64"},
+        {"name":"maxBet","type":"u64"}
+      ]
+    },
+    {
+      "name": "depositLiquidityUsdc",
+      "accounts": [
+        {"name":"operator","isMut":true,"isSigner":true},
+        {"name":"operatorUsdcAta","isMut":true,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args":[{"name":"amount","type":"u64"}]
+    },
+    {
+      "name": "placeBet",
+      "accounts": [
+        {"name":"player","isMut":true,"isSigner":true},
+        {"name":"playerUsdcAta","isMut":true,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"bet","isMut":true,"isSigner":false},
+        {"name":"random","isMut":true,"isSigner":false},
+        {"name":"treasury","isMut":true,"isSigner":false},
+        {"name":"config","isMut":false,"isSigner":false},
+        {"name":"vrf","isMut":false,"isSigner":false},
+        {"name":"systemProgram","isMut":false,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": [{"name":"betKind","type":{"defined":"BetKind"}},{"name":"stake","type":"u64"},{"name":"force","type":{"array":"u8","len":32}}]
+    },
+    {
+      "name": "resolveBet",
+      "accounts": [
+        {"name":"resolver","isMut":true,"isSigner":true},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"bet","isMut":true,"isSigner":false},
+        {"name":"playerUsdcAta","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"random","isMut":true,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": []
+    },
+    {
+      "name": "refundExpiredBet",
+      "accounts": [
+        {"name":"caller","isMut":true,"isSigner":true},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"bet","isMut":true,"isSigner":false},
+        {"name":"playerUsdcAta","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": []
+    },
+    {
+      "name": "depositGov",
+      "accounts": [
+        {"name":"depositor","isMut":true,"isSigner":true},
+        {"name":"depositorGovAta","isMut":true,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"controlVaultGov","isMut":true,"isSigner":false},
+        {"name":"govDeposit","isMut":true,"isSigner":false},
+        {"name":"systemProgram","isMut":false,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": [{"name":"amount","type":"u64"}]
+    },
+    {
+      "name": "withdrawGov",
+      "accounts": [
+        {"name":"depositor","isMut":true,"isSigner":true},
+        {"name":"depositorGovAta","isMut":true,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"controlVaultGov","isMut":true,"isSigner":false},
+        {"name":"govDeposit","isMut":true,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": [{"name":"amount","type":"u64"}]
+    },
+    {
+      "name": "claimOperator",
+      "accounts": [
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"govDeposit","isMut":true,"isSigner":false},
+        {"name":"depositor","isMut":false,"isSigner":false}
+      ],
+      "args": []
+    },
+    {
+      "name": "setMode",
+      "accounts": [
+        {"name":"operator","isMut":true,"isSigner":true},
+        {"name":"table","isMut":true,"isSigner":false}
+      ],
+      "args": [{"name":"mode","type":{"defined":"TableMode"}}]
+    },
+    {
+      "name": "pause",
+      "accounts": [{"name":"operator","isMut":true,"isSigner":true},{"name":"table","isMut":true,"isSigner":false}],
+      "args": []
+    },
+    {
+      "name": "unpause",
+      "accounts": [{"name":"operator","isMut":true,"isSigner":true},{"name":"table","isMut":true,"isSigner":false}],
+      "args": []
+    },
+    {
+      "name": "requestWithdraw",
+      "accounts": [{"name":"operator","isMut":true,"isSigner":true},{"name":"table","isMut":true,"isSigner":false}],
+      "args": [{"name":"amount","type":"u64"}]
+    },
+    {
+      "name": "executeWithdraw",
+      "accounts": [
+        {"name":"operator","isMut":true,"isSigner":true},
+        {"name":"operatorUsdcAta","isMut":true,"isSigner":false},
+        {"name":"table","isMut":true,"isSigner":false},
+        {"name":"vaultUsdc","isMut":true,"isSigner":false},
+        {"name":"tokenProgram","isMut":false,"isSigner":false}
+      ],
+      "args": [{"name":"amount","type":"u64"}]
+    }
+  ],
+  "types": [
+    {"name":"TableMode","type":{"kind":"enum","variants":[{"name":"Private"},{"name":"Public"}]}},
+    {"name":"BetKind","type":{"kind":"enum","variants":[
+      {"name":"Straight","fields":[{"name":"number","type":"u8"}]},
+      {"name":"Split","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]},
+      {"name":"Street","fields":[{"name":"row","type":"u8"}]},
+      {"name":"Corner","fields":[{"name":"row","type":"u8"},{"name":"col","type":"u8"}]},
+      {"name":"SixLine","fields":[{"name":"row","type":"u8"}]},
+      {"name":"Red"},{"name":"Black"},{"name":"Even"},{"name":"Odd"},{"name":"Low"},{"name":"High"},
+      {"name":"Dozen","fields":[{"name":"idx","type":"u8"}]},
+      {"name":"Column","fields":[{"name":"idx","type":"u8"}]}
+    ]}}
+  ]
+}
