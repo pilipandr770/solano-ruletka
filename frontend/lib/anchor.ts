@@ -1,26 +1,220 @@
 import * as anchor from '@coral-xyz/anchor'
-import { PublicKey, Connection, Transaction } from '@solana/web3.js'
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token'
-import { Buffer } from 'buffer'
+import { PublicKey, SystemProgram, Connection } from '@solana/web3.js'
+import {
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token'
 import { sha256 } from '@noble/hashes/sha256'
-import idl from '../idl/roulette_table.json'
 
-function toSnakeCase(name: string) {
+/**
+ * ORAO VRF (Classic VRF program id; devnet/mainnet)
+ * Repo/docs: https://github.com/orao-network/solana-vrf
+ */
+export const ORAO_VRF_PROGRAM_ID = new PublicKey(
+  'VRFzZoJdhFWL8rkvu87LpKM3RbcVezpMEc6X5GVDr7y'
+)
+
+// Seeds from orao-solana-vrf crate constants:
+// CONFIG_ACCOUNT_SEED = b"orao-vrf-network-configuration"
+// RANDOMNESS_ACCOUNT_SEED = b"orao-vrf-randomness-request"
+const ORAO_CONFIG_SEED = 'orao-vrf-network-configuration'
+const ORAO_RANDOMNESS_SEED = 'orao-vrf-randomness-request'
+
+/**
+ * Minimal helpers to decode our Anchor accounts without a full IDL (accounts are not in frontend/idl).
+ * We only decode fields we actually need in frontend flows.
+ */
+
+function readU64LE(buf: Uint8Array, offset: number): { value: bigint; next: number } {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  const lo = view.getUint32(offset, true)
+  const hi = view.getUint32(offset + 4, true)
+  const v = (BigInt(hi) << 32n) | BigInt(lo)
+  return { value: v, next: offset + 8 }
+}
+
+function readI64LE(buf: Uint8Array, offset: number): { value: bigint; next: number } {
+  const { value, next } = readU64LE(buf, offset)
+  const signed = value > 0x7fffffffffffffffn ? (value - 0x10000000000000000n) : value
+  return { value: signed, next }
+}
+
+function readU32LE(buf: Uint8Array, offset: number): { value: number; next: number } {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  const v = view.getUint32(offset, true)
+  return { value: v, next: offset + 4 }
+}
+
+function readU16LE(buf: Uint8Array, offset: number): { value: number; next: number } {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  const v = view.getUint16(offset, true)
+  return { value: v, next: offset + 2 }
+}
+
+function readU8(buf: Uint8Array, offset: number): { value: number; next: number } {
+  return { value: buf[offset], next: offset + 1 }
+}
+
+function readBool(buf: Uint8Array, offset: number): { value: boolean; next: number } {
+  const { value, next } = readU8(buf, offset)
+  return { value: value !== 0, next }
+}
+
+function readPubkey(buf: Uint8Array, offset: number): { value: PublicKey; next: number } {
+  const slice = buf.slice(offset, offset + 32)
+  return { value: new PublicKey(slice), next: offset + 32 }
+}
+
+function skipAnchorDiscriminator(offset = 0): number {
+  return offset + 8
+}
+
+type DecodedTable = {
+  seed: bigint
+  creator: PublicKey
+  operator: PublicKey
+  mode: number
+  paused: boolean
+  usdcMint: PublicKey
+  govMint: PublicKey
+  vaultUsdc: PublicKey
+  controlVaultGov: PublicKey
+  minBet: bigint
+  maxBet: bigint
+  lockedLiability: bigint
+  activeBets: number
+  betSeq: bigint
+}
+
+function decodeTableAccount(data: Uint8Array): DecodedTable {
+  let o = skipAnchorDiscriminator(0)
+
+  const seed = readU64LE(data, o); o = seed.next
+  const creator = readPubkey(data, o); o = creator.next
+  const operator = readPubkey(data, o); o = operator.next
+
+  const mode = readU8(data, o); o = mode.next
+  const paused = readBool(data, o); o = paused.next
+
+  const usdcMint = readPubkey(data, o); o = usdcMint.next
+  const govMint = readPubkey(data, o); o = govMint.next
+  const vaultUsdc = readPubkey(data, o); o = vaultUsdc.next
+  const controlVaultGov = readPubkey(data, o); o = controlVaultGov.next
+
+  const minBet = readU64LE(data, o); o = minBet.next
+  const maxBet = readU64LE(data, o); o = maxBet.next
+
+  const lockedLiability = readU64LE(data, o); o = lockedLiability.next
+  const activeBets = readU32LE(data, o); o = activeBets.next
+  const betSeq = readU64LE(data, o); o = betSeq.next
+
+  return {
+    seed: seed.value,
+    creator: creator.value,
+    operator: operator.value,
+    mode: mode.value,
+    paused: paused.value,
+    usdcMint: usdcMint.value,
+    govMint: govMint.value,
+    vaultUsdc: vaultUsdc.value,
+    controlVaultGov: controlVaultGov.value,
+    minBet: minBet.value,
+    maxBet: maxBet.value,
+    lockedLiability: lockedLiability.value,
+    activeBets: activeBets.value,
+    betSeq: betSeq.value,
+  }
+}
+
+type DecodedBet = {
+  table: PublicKey
+  player: PublicKey
+  stake: bigint
+  multiplier: number
+  maxTotalPayout: bigint
+  kindTag: number
+  state: number
+  createdTs: bigint
+  force: Uint8Array
+  randomnessAccount: PublicKey
+  resultNumber: number | null
+}
+
+function betKindPayloadLen(tag: number): number {
+  switch (tag) {
+    case 0: return 1
+    case 1: return 2
+    case 2: return 1
+    case 3: return 2
+    case 4: return 1
+    case 5: return 0
+    case 6: return 0
+    case 7: return 0
+    case 8: return 0
+    case 9: return 0
+    case 10: return 0
+    case 11: return 1
+    case 12: return 1
+    default: return 0
+  }
+}
+
+function decodeBetAccount(data: Uint8Array): DecodedBet {
+  let o = skipAnchorDiscriminator(0)
+
+  const table = readPubkey(data, o); o = table.next
+  const player = readPubkey(data, o); o = player.next
+
+  const stake = readU64LE(data, o); o = stake.next
+  const multiplier = readU16LE(data, o); o = multiplier.next
+  const maxTotalPayout = readU64LE(data, o); o = maxTotalPayout.next
+
+  const kindTag = readU8(data, o); o = kindTag.next
+  const payloadLen = betKindPayloadLen(kindTag.value)
+  o += payloadLen
+
+  const state = readU8(data, o); o = state.next
+
+  const createdTs = readI64LE(data, o); o = createdTs.next
+
+  const force = data.slice(o, o + 32); o += 32
+
+  const randomnessAccount = readPubkey(data, o); o = randomnessAccount.next
+
+  const opt = readU8(data, o); o = opt.next
+  let resultNumber: number | null = null
+  if (opt.value === 1) {
+    const rn = readU8(data, o); o = rn.next
+    resultNumber = rn.value
+  }
+
+  return {
+    table: table.value,
+    player: player.value,
+    stake: stake.value,
+    multiplier: multiplier.value,
+    maxTotalPayout: maxTotalPayout.value,
+    kindTag: kindTag.value,
+    state: state.value,
+    createdTs: createdTs.value,
+    force,
+    randomnessAccount: randomnessAccount.value,
+    resultNumber,
+  }
+}
+
+function randomForce32(): Uint8Array {
+  const arr = new Uint8Array(32)
+  crypto.getRandomValues(arr)
+  return arr
+}
+
+function toSnakeCase(name: string): string {
   if (!name) return name
   return name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toLowerCase()
 }
 
-function toPublicKey(value: any, label: string): PublicKey {
-  if (value === undefined || value === null) {
-    throw new Error(`${label} is missing`)
-  }
-  if (typeof value === 'object' && typeof value?.toBase58 === 'function') {
-    return new PublicKey(value.toBase58())
-  }
-  return new PublicKey(value)
-}
-
-function withInstructionDiscriminators(rawIdl: any) {
+function withInstructionDiscriminators(rawIdl: any): any {
   const instructions = (rawIdl?.instructions || []).map((ix: any) => {
     if (Array.isArray(ix?.discriminator) && ix.discriminator.length === 8) return ix
     const snakeName = toSnakeCase(ix.name)
@@ -31,255 +225,284 @@ function withInstructionDiscriminators(rawIdl: any) {
   return { ...rawIdl, instructions }
 }
 
-export async function initProgram(wallet: any, connection: Connection) {
-  if (!wallet || !connection) throw new Error('wallet and connection required')
-  const provider = new anchor.AnchorProvider(connection, wallet as any, anchor.AnchorProvider.defaultOptions())
-  const programId = toPublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID, 'NEXT_PUBLIC_PROGRAM_ID')
-  // Anchor v0.31 Program constructor derives programId from `idl.address`.
-  // Our frontend IDL is instruction-only and lacks `address`, so we inject it.
-  const idlWithAddress = { ...(idl as any), address: programId.toBase58() }
+export async function initProgram(idl: any, programId: PublicKey, provider: anchor.AnchorProvider) {
+  anchor.setProvider(provider)
+  
+  // Our IDL is instruction-only and lacks 'address' field, so we inject it
+  const idlWithAddress = { ...idl, address: programId.toBase58() }
   const idlWithDiscriminators = withInstructionDiscriminators(idlWithAddress)
-  const program = new (anchor.Program as any)(idlWithDiscriminators, provider) as anchor.Program
+  
+  const program = new anchor.Program(idlWithDiscriminators, provider)
   return { program, provider }
 }
 
-export async function createTable(program: anchor.Program, payer: PublicKey, params: { seed: number; usdcMint: string; govMint: string; minBet: number; maxBet: number }) {
-  try {
-    console.log('[1] Starting createTable')
-    console.log('[2] program:', program)
-    console.log('[2.5] program._idl.instructions:', (program as any)?._idl?.instructions?.map((i: any) => i.name))
-    console.log('[2.6] program.methods:', Object.keys((program as any)?.methods || {}))
-    console.log('[3] program.programId:', program?.programId?.toBase58())
-    console.log('[4] payer:', payer?.toBase58())
-    console.log('[5] params:', JSON.stringify(params))
-    
-    if (!program?.programId) throw new Error('Program not initialized')
-    if (!payer) throw new Error('payer is required')
-    if (!params) throw new Error('params is required')
-    console.log('createTable params:', params)
-    if (!params?.usdcMint) throw new Error('usdcMint is required')
-    if (!params?.govMint) throw new Error('govMint is required')
-    if (params.seed === undefined || params.seed === null || isNaN(params.seed)) throw new Error(`seed is invalid: ${params.seed}`)
-    if (params.minBet === undefined || params.minBet === null || isNaN(params.minBet)) throw new Error(`minBet is invalid: ${params.minBet}`)
-    if (params.maxBet === undefined || params.maxBet === null || isNaN(params.maxBet)) throw new Error(`maxBet is invalid: ${params.maxBet}`)
-    
-    console.log('[6] Creating BN for seed:', params.seed)
-    const seedBn = new anchor.BN(Math.floor(params.seed))
-    console.log('[7] seedBn created:', seedBn.toString())
-    
-    // TableMode as u8: Private = 0, Public = 1
-    const mode = 0
-    console.log('[8] mode (u8):', mode)
-    
-    console.log('[9] Creating BN for minBet:', params.minBet)
-    const minB = new anchor.BN(Math.floor(params.minBet))
-    console.log('[10] minB created:', minB.toString())
-    
-    console.log('[11] Creating BN for maxBet:', params.maxBet)
-    const maxB = new anchor.BN(Math.floor(params.maxBet))
-    console.log('[12] maxB created:', maxB.toString())
+export async function createTable(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  params: {
+    seed: number
+    usdcMint: string
+    govMint: string
+    mode: number
+    minBet: number
+    maxBet: number
+  }
+) {
+  const payer = provider.wallet.publicKey
 
-  console.log('[12] maxB created:', maxB.toString())
+  const seedBn = new anchor.BN(params.seed)
+  const mode = params.mode
+  const minB = new anchor.BN(params.minBet)
+  const maxB = new anchor.BN(params.maxBet)
 
-  console.log('[13] Creating PublicKey for usdcMint:', params.usdcMint)
-  const usdcMintPk = toPublicKey(params.usdcMint, 'usdcMint')
-  console.log('[14] usdcMintPk:', usdcMintPk.toBase58())
-  
-  console.log('[15] Creating PublicKey for govMint:', params.govMint)
-  const govMintPk = toPublicKey(params.govMint, 'govMint')
-  console.log('[16] govMintPk:', govMintPk.toBase58())
-  
-  console.log('[17] About to compute PDAs, payer:', payer.toBase58(), 'programId:', program.programId.toBase58())
-  console.log('[18] seedBn value:', seedBn.toString(), 'typeof Buffer:', typeof Buffer, 'Buffer exists:', !!Buffer)
-  
-  console.log('[19] Creating seed buffer using toArray...')
-  const seedArray = seedBn.toArray('le', 8)
-  console.log('[20] seedArray:', seedArray)
-  const seedBuffer = Uint8Array.from(seedArray)
-  console.log('[21] seedBuffer (Uint8Array):', seedBuffer)
-  
-  console.log('[23] Computing table PDA...')
-  const [tablePda] = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from('table'), payer.toBuffer(), seedBuffer], 
+  const usdcMintPk = new PublicKey(params.usdcMint)
+  const govMintPk = new PublicKey(params.govMint)
+
+  const seedBuf = seedBn.toArrayLike(Buffer, 'le', 8)
+  const [tablePda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('table'), payer.toBuffer(), seedBuf],
     program.programId
   )
-  console.log('[24] tablePda:', tablePda.toBase58())
-  
-  console.log('[25] Computing vault_usdc PDA...')
-  const [vaultUsdcPda] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('vault_usdc'), tablePda.toBuffer()], program.programId)
-  console.log('[26] vaultUsdcPda:', vaultUsdcPda.toBase58())
-  
-  console.log('[27] Computing control_vault_gov PDA...')
-  const [controlVaultGovPda] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('vault_gov'), tablePda.toBuffer()], program.programId)
-  console.log('[28] controlVaultGovPda:', controlVaultGovPda.toBase58())
 
-  console.log('[28] controlVaultGovPda:', controlVaultGovPda.toBase58())
+  const [vaultUsdcPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('vault_usdc'), tablePda.toBuffer()],
+    program.programId
+  )
 
-  console.log('[29] Building accounts object...')
-  const accounts = {
-    creator: payer,
-    usdcMint: usdcMintPk,
-    govMint: govMintPk,
-    table: tablePda,
-    vaultUsdc: vaultUsdcPda,
-    controlVaultGov: controlVaultGovPda,
-    systemProgram: anchor.web3.SystemProgram.programId,
-    tokenProgram: TOKEN_PROGRAM_ID,
-    rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-  }
-  console.log('[30] accounts built:', Object.keys(accounts))
-  
-  for (const [name, value] of Object.entries(accounts)) {
-    console.log(`[31] Validating account ${name}:`, value?.toString())
-    if (value === undefined || value === null) {
-      throw new Error(`createTable: account '${name}' is ${String(value)}`)
-    }
-  }
-  
-  console.log('[32] All accounts validated')
-  console.log('[33] Preparing RPC call with args:')
-  console.log('  - seedBn:', seedBn.toString(), 'type:', typeof seedBn, 'constructor:', seedBn.constructor.name)
-  console.log('  - mode:', JSON.stringify(mode), 'type:', typeof mode)
-  console.log('  - minB:', minB.toString(), 'type:', typeof minB, 'constructor:', minB.constructor.name)
-  console.log('  - maxB:', maxB.toString(), 'type:', typeof maxB, 'constructor:', maxB.constructor.name)
+  const [controlVaultGovPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('vault_gov'), tablePda.toBuffer()],
+    program.programId
+  )
 
-  try {
-    console.log('[34] Calling program.methods.createTable...')
-    const tx = await program.methods
-      .createTable(seedBn, mode, minB, maxB)
-      .accounts(accounts)
-      .rpc()
-    console.log('[35] createTable success:', tx)
-    return tx
-  } catch (rpcError: any) {
-    console.error('[36] RPC call failed:', rpcError)
-    console.error('[37] RPC error message:', rpcError.message)
-    console.error('[38] RPC error stack:', rpcError.stack)
-    if (rpcError?.transactionMessage) console.error('[39] tx message:', rpcError.transactionMessage)
-    if (rpcError?.transactionLogs) console.error('[40] tx logs:', rpcError.transactionLogs)
-    if (rpcError?.logs) console.error('[41] logs:', rpcError.logs)
-    if (typeof rpcError?.getLogs === 'function') {
-      try {
-        const l = await rpcError.getLogs()
-        console.error('[42] getLogs():', l)
-      } catch (e) {
-        console.error('[43] getLogs() failed:', e)
-      }
-    }
-    throw rpcError
-  }
-  } catch (error: any) {
-    console.error('[ERROR] createTable error:', error)
-    console.error('[ERROR] error.message:', error.message)
-    console.error('[ERROR] error.stack:', error.stack)
-    throw new Error(`createTable failed: ${error.message}`)
+  // Build instruction manually to force correct account metas
+  const ix = await program.methods
+    .createTable(seedBn, mode, minB, maxB)
+    .accounts({
+      creator: payer,
+      operator: payer,
+      table: tablePda,
+      usdcMint: usdcMintPk,
+      govMint: govMintPk,
+      vaultUsdc: vaultUsdcPda,
+      controlVaultGov: controlVaultGovPda,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    })
+    .instruction()
+
+  // Force signer/writable flags (IDL lacks account metadata)
+  const signerSet = new Set<string>([payer.toBase58()])
+  const writableSet = new Set<string>([
+    payer.toBase58(),
+    tablePda.toBase58(),
+    vaultUsdcPda.toBase58(),
+    controlVaultGovPda.toBase58(),
+  ])
+  
+  ix.keys = ix.keys.map((k) => ({
+    ...k,
+    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
+    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
+  }))
+
+  const tx = new anchor.web3.Transaction().add(ix)
+  tx.feePayer = payer
+  const txSig = await provider.sendAndConfirm(tx, [])
+
+  return {
+    txSig,
+    tablePda: tablePda.toBase58(),
+    vaultUsdcPda: vaultUsdcPda.toBase58(),
+    controlVaultGovPda: controlVaultGovPda.toBase58(),
   }
 }
 
-export async function depositLiquidity(program: anchor.Program, operator: PublicKey, operatorUsdcAta: PublicKey, table: PublicKey, amount: number) {
-  const a = new anchor.BN(amount)
-  const [vaultUsdc] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('vault_usdc'), table.toBuffer()], program.programId)
-  return program.rpc.depositLiquidityUsdc(a, {
+export async function depositLiquidity(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  args: {
+    table: PublicKey
+    amount: number
+    operatorUsdcAta?: PublicKey
+  }
+) {
+  const operator = provider.wallet.publicKey
+
+  const operatorUsdcAta =
+    args.operatorUsdcAta ??
+    getAssociatedTokenAddressSync(
+      (await (async () => {
+        const info = await provider.connection.getAccountInfo(args.table)
+        if (!info?.data) throw new Error('Table account not found')
+        const t = decodeTableAccount(info.data)
+        return t.usdcMint
+      })()),
+      operator
+    )
+
+  const [vaultUsdc] = PublicKey.findProgramAddressSync(
+    [Buffer.from('vault_usdc'), args.table.toBuffer()],
+    program.programId
+  )
+
+  return program.rpc.depositLiquidityUsdc(new anchor.BN(args.amount), {
     accounts: {
       operator,
       operatorUsdcAta,
-      table,
+      table: args.table,
       vaultUsdc,
-      tokenProgram: TOKEN_PROGRAM_ID
-    }
+      tokenProgram: TOKEN_PROGRAM_ID,
+    },
   })
 }
 
-export async function placeBet(program: anchor.Program, player: PublicKey, playerUsdcAta: PublicKey, table: PublicKey, betKind: any, stake: number) {
-  if (!program?.provider?.connection) throw new Error('Program/provider not initialized')
-  if (!player) throw new Error('player is required')
-  if (!playerUsdcAta) throw new Error('playerUsdcAta is required')
-  if (!table) throw new Error('table is required')
-  if (!betKind) throw new Error('betKind is required')
-  if (!Number.isFinite(stake) || stake <= 0) throw new Error('stake must be a positive number')
+export async function placeBet(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  args: {
+    table: PublicKey
+    stake: number
+    betKind: any
+    playerUsdcAta?: PublicKey
+  }
+) {
+  const player = provider.wallet.publicKey
 
-  const stakeBn = new anchor.BN(stake)
-  const force = new Uint8Array(32)
+  const tableInfo = await provider.connection.getAccountInfo(args.table)
+  if (!tableInfo?.data) throw new Error('Table account not found')
+  const table = decodeTableAccount(tableInfo.data)
 
-  // Read Table account bytes (our current IDL in frontend is instruction-only, so we decode minimally).
-  const tableInfo = await program.provider.connection.getAccountInfo(table)
-  if (!tableInfo?.data) throw new Error('Table account not found: ' + table.toBase58())
-  // Layout (Anchor/Borsh, little endian), offsets include 8-byte discriminator.
-  // vault_usdc Pubkey is at struct offset 138; bet_seq u64 is at struct offset 230.
-  const VAULT_USDC_OFFSET = 8 + 138
-  const BET_SEQ_OFFSET = 8 + 230
-  if (tableInfo.data.length < BET_SEQ_OFFSET + 8) throw new Error('Table account too small: ' + tableInfo.data.length)
-  const vaultUsdc = new anchor.web3.PublicKey(tableInfo.data.slice(VAULT_USDC_OFFSET, VAULT_USDC_OFFSET + 32))
-  const betSeqBn = new anchor.BN(tableInfo.data.slice(BET_SEQ_OFFSET, BET_SEQ_OFFSET + 8), undefined, 'le')
-  const [bet] = anchor.web3.PublicKey.findProgramAddressSync(
-    [Buffer.from('bet'), table.toBuffer(), player.toBuffer(), betSeqBn.toArrayLike(Buffer, 'le', 8)],
-    program.programId,
+  const betSeq = table.betSeq
+  const betSeqBn = new anchor.BN(betSeq.toString(10))
+
+  const [betPda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('bet'),
+      args.table.toBuffer(),
+      player.toBuffer(),
+      betSeqBn.toArrayLike(Buffer, 'le', 8),
+    ],
+    program.programId
   )
 
-  // ORAO VRF program + PDAs.
-  const oraoProgramId = new anchor.web3.PublicKey(process.env.NEXT_PUBLIC_ORAO_PROGRAM_ID || 'VRFzZoJdhFWL8rkvu87LpKM3RbcVezpMEc6X5GVDr7y')
-  const [config] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('orao-vrf-network-configuration')], oraoProgramId)
+  const [configPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from(ORAO_CONFIG_SEED)],
+    ORAO_VRF_PROGRAM_ID
+  )
 
-  // ORAO randomness request PDA: ["orao-vrf-randomness-request", force]
-  const [random] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('orao-vrf-randomness-request'), Buffer.from(force)], oraoProgramId)
+  const cfgInfo = await provider.connection.getAccountInfo(configPda)
+  if (!cfgInfo?.data) throw new Error('ORAO config account not found')
 
-  // Treasury is stored inside ORAO NetworkState config (Anchor account).
-  const cfgInfo = await program.provider.connection.getAccountInfo(config)
-  if (!cfgInfo?.data) throw new Error('ORAO config account not found: ' + config.toBase58())
-  if (cfgInfo.data.length < 8 + 32 + 32) throw new Error('ORAO config account too small: ' + cfgInfo.data.length)
-  const treasury = new anchor.web3.PublicKey(cfgInfo.data.slice(8 + 32, 8 + 32 + 32))
+  const treasury = new PublicKey(cfgInfo.data.slice(8 + 32, 8 + 64))
 
-  const vrf = oraoProgramId
-  const accounts = {
-    player,
-    playerUsdcAta,
-    table,
-    vaultUsdc,
-    bet,
-    random,
-    treasury,
-    config,
-    vrf,
-    systemProgram: anchor.web3.SystemProgram.programId,
-    tokenProgram: TOKEN_PROGRAM_ID,
-  }
-  for (const [name, value] of Object.entries(accounts)) {
-    if (value === undefined || value === null) {
-      throw new Error(`placeBet: account '${name}' is ${String(value)}`)
+  const force = randomForce32()
+
+  const [randomPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from(ORAO_RANDOMNESS_SEED), Buffer.from(force)],
+    ORAO_VRF_PROGRAM_ID
+  )
+
+  const usdcMint = table.usdcMint
+  const playerUsdcAta =
+    args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMint, player)
+
+  const txSig = await program.rpc.placeBet(
+    new anchor.BN(args.stake),
+    force,
+    args.betKind,
+    {
+      accounts: {
+        player,
+        table: args.table,
+        bet: betPda,
+        playerUsdcAta,
+        vaultUsdc: table.vaultUsdc,
+        config: configPda,
+        treasury,
+        random: randomPda,
+        vrf: ORAO_VRF_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      },
     }
+  )
+
+  return {
+    txSig,
+    betPda: betPda.toBase58(),
+    randomPda: randomPda.toBase58(),
+    treasury: treasury.toBase58(),
   }
-  return program.rpc.placeBet(betKind, stakeBn, [...force], {
-    accounts
-  })
 }
 
-export async function resolveBet(program: anchor.Program, resolver: PublicKey, table: PublicKey, bet: PublicKey, playerUsdcAta: PublicKey) {
-  const [vaultUsdc] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('vault_usdc'), table.toBuffer()], program.programId)
-  const [random] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('random'), table.toBuffer(), bet.toBuffer()], program.programId)
+export async function resolveBet(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  args: {
+    table: PublicKey
+    bet: PublicKey
+    player?: PublicKey
+    playerUsdcAta?: PublicKey
+  }
+) {
+  const resolver = provider.wallet.publicKey
+
+  const tableInfo = await provider.connection.getAccountInfo(args.table)
+  if (!tableInfo?.data) throw new Error('Table account not found')
+  const table = decodeTableAccount(tableInfo.data)
+
+  const betInfo = await provider.connection.getAccountInfo(args.bet)
+  if (!betInfo?.data) throw new Error('Bet account not found')
+  const bet = decodeBetAccount(betInfo.data)
+
+  const player = args.player ?? bet.player
+  const playerUsdcAta =
+    args.playerUsdcAta ?? getAssociatedTokenAddressSync(table.usdcMint, player)
+
+  const random = bet.randomnessAccount
+
   return program.rpc.resolveBet({
     accounts: {
       resolver,
-      table,
-      bet,
+      table: args.table,
+      bet: args.bet,
       playerUsdcAta,
-      vaultUsdc,
+      vaultUsdc: table.vaultUsdc,
       random,
-      tokenProgram: TOKEN_PROGRAM_ID
-    }
+      tokenProgram: TOKEN_PROGRAM_ID,
+    },
   })
 }
 
-export async function refundExpired(program: anchor.Program, caller: PublicKey, table: PublicKey, bet: PublicKey, playerUsdcAta: PublicKey) {
-  const [vaultUsdc] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('vault_usdc'), table.toBuffer()], program.programId)
-  return program.rpc.refundExpiredBet({
+export async function refundExpired(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  args: {
+    table: PublicKey
+    bet: PublicKey
+    player?: PublicKey
+    playerUsdcAta?: PublicKey
+  }
+) {
+  const player = args.player ?? provider.wallet.publicKey
+
+  const tableInfo = await provider.connection.getAccountInfo(args.table)
+  if (!tableInfo?.data) throw new Error('Table account not found')
+  const table = decodeTableAccount(tableInfo.data)
+
+  const playerUsdcAta =
+    args.playerUsdcAta ?? getAssociatedTokenAddressSync(table.usdcMint, player)
+
+  return program.rpc.refundExpired({
     accounts: {
-      caller,
-      table,
-      bet,
+      player,
+      table: args.table,
+      bet: args.bet,
       playerUsdcAta,
-      vaultUsdc,
-      tokenProgram: TOKEN_PROGRAM_ID
-    }
+      vaultUsdc: table.vaultUsdc,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    },
   })
 }
 
