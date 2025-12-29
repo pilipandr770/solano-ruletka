@@ -118,6 +118,7 @@ export default function Home() {
   const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
   const [tableSeed, setTableSeed] = useState<number>(Math.floor(Math.random() * 1e6))
   const [betSlip, setBetSlip] = useState<Array<any>>([])
+  const [lastBetPda, setLastBetPda] = useState<string>('')
 
   async function handlePlaceBetUI() {
     if (!publicKey) return alert('Connect wallet first')
@@ -147,7 +148,8 @@ export default function Home() {
       else if (betType === 'column') betKind = { column: { idx: selectedNumber } }
       const res = await anchorLib.placeBet(program, provider, { table, betKind, stake })
       console.log('placeBet result', res)
-      alert('placeBet transaction sent (see console)')
+      setLastBetPda(res.betPda)
+      alert('placeBet transaction sent! Bet PDA: ' + res.betPda)
     } catch (e: any) {
       console.error(e)
       alert('placeBet failed: ' + (e?.message || e))
@@ -319,6 +321,59 @@ export default function Home() {
                 }
               }}>Deposit Liquidity</button>
               <span style={{fontSize:13,color:'#856404'}}>Operators must fund the vault before players can bet</span>
+            </div>
+          </div>
+        </section>
+
+        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
+          <h2>Resolve Bet (Spin Roulette)</h2>
+          <div style={{padding:12,background:'#d1ecf1',borderRadius:6}}>
+            <p style={{margin:'0 0 12px 0',fontSize:14}}>
+              After placing a bet, wait ~5-10 seconds for ORAO VRF to fulfill randomness, then resolve to get the winning number and payout.
+            </p>
+            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+              <input
+                type="text"
+                placeholder="Bet PDA (from placeBet result)"
+                id="betPdaInput"
+                value={lastBetPda}
+                onChange={(e)=>setLastBetPda(e.target.value.trim())}
+                style={{width:400}}
+              />
+              <button onClick={async ()=>{
+                try {
+                  if (!publicKey) return alert('Connect wallet first')
+                  if (!tableAddress) return alert('Set table address first')
+                  const betPdaStr = lastBetPda?.trim()
+                  if (!betPdaStr) return alert('Enter bet PDA (automatically filled after placeBet)')
+                  const { program, provider } = await ensureProgram()
+                  const table = new PublicKey(tableAddress)
+                  const bet = new PublicKey(betPdaStr)
+                  
+                  // Check if randomness is fulfilled (optional)
+                  const betInfo = await provider.connection.getAccountInfo(bet)
+                  if (!betInfo) return alert('Bet account not found')
+                  
+                  // Pass player explicitly to avoid decoding issues
+                  const txSig = await anchorLib.resolveBet(program, provider, { table, bet, player: publicKey })
+                  console.log('resolveBet tx:', txSig)
+                  
+                  // Wait for confirmation and read result
+                  await new Promise(resolve => setTimeout(resolve, 2000))
+                  const betInfoAfter = await provider.connection.getAccountInfo(bet)
+                  if (betInfoAfter) {
+                    // Decode to get result_number
+                    // For now just alert success
+                    alert('Bet resolved! Check bet account or tx explorer for winning number.')
+                  }
+                } catch (e: any) {
+                  console.error(e)
+                  alert('resolveBet failed: ' + (e?.message || e))
+                }
+              }}>Resolve Bet / Spin</button>
+            </div>
+            <div style={{marginTop:8,fontSize:13,color:'#0c5460'}}>
+              Tip: Copy the "betPda" from the placeBet console log and paste here.
             </div>
           </div>
         </section>

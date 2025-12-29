@@ -130,14 +130,13 @@ type DecodedBet = {
   table: PublicKey
   player: PublicKey
   stake: bigint
-  multiplier: number
-  maxTotalPayout: bigint
   kindTag: number
-  state: number
   createdTs: bigint
   force: Uint8Array
   randomnessAccount: PublicKey
   resultNumber: number | null
+  payout: bigint
+  isSettled: boolean
 }
 
 function betKindPayloadLen(tag: number): number {
@@ -181,25 +180,24 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
 
   const randomnessAccount = readPubkey(data, o); o = randomnessAccount.next
 
-  const opt = readU8(data, o); o = opt.next
+  const resultNumberOpt = readU8(data, o); o = resultNumberOpt.next
   let resultNumber: number | null = null
-  if (opt.value === 1) {
-    const rn = readU8(data, o); o = rn.next
-    resultNumber = rn.value
+  if (resultNumberOpt.value === 1) {
+      const rn = readU8(data, o); o = rn.next
+      resultNumber = rn.value
   }
 
   return {
     table: table.value,
     player: player.value,
     stake: stake.value,
-    multiplier: multiplier.value,
-    maxTotalPayout: maxTotalPayout.value,
     kindTag: kindTag.value,
-    state: state.value,
     createdTs: createdTs.value,
     force,
     randomnessAccount: randomnessAccount.value,
     resultNumber,
+    payout: 0n, // Not in struct
+    isSettled: state.value !== 0 // Pending=0
   }
 }
 
@@ -412,58 +410,112 @@ export async function placeBet(
     ORAO_VRF_PROGRAM_ID
   )
 
-  const cfgInfo = await provider.connection.getAccountInfo(configPda)
-  if (!cfgInfo?.data) throw new Error('ORAO config account not found')
+  // const cfgInfo = await provider.connection.getAccountInfo(configPda)
+  // if (!cfgInfo?.data) throw new Error('ORAO config account not found')
 
-  const treasury = new PublicKey(cfgInfo.data.slice(8 + 32, 8 + 64))
+  // const treasury = new PublicKey(cfgInfo.data.slice(8 + 32, 8 + 64))
+  const treasury = new PublicKey('9ZTHWWZDpB36UFe1vszf2KEpt83vwi27jDqtHQ7NSXyR') // Hardcoded treasury for now
 
   const force = randomForce32()
 
+  // Random PDA uses YOUR program ID (not ORAO's) since we commented out ORAO VRF
   const [randomPda] = PublicKey.findProgramAddressSync(
     [Buffer.from(ORAO_RANDOMNESS_SEED), Buffer.from(force)],
-    ORAO_VRF_PROGRAM_ID
+    program.programId
   )
 
   const usdcMint = table.usdcMint
   const playerUsdcAta =
     args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMint, player)
 
-  // Build instruction manually to force correct account metas
-  const ix = await program.methods
-    .placeBet(args.betKind, new anchor.BN(args.stake), Array.from(force))
-    .accounts({
-      player,
-      table: args.table,
-      bet: betPda,
-      playerUsdcAta,
-      vaultUsdc: table.vaultUsdc,
-      config: configPda,
-      treasury,
-      random: randomPda,
-      vrf: ORAO_VRF_PROGRAM_ID,
-      systemProgram: SystemProgram.programId,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .instruction()
-
-  // Force signer/writable flags (IDL lacks account metadata)
-  const signerSet = new Set<string>([player.toBase58()])
-  const writableSet = new Set<string>([
-    player.toBase58(),
-    args.table.toBase58(),
-    betPda.toBase58(),
-    playerUsdcAta.toBase58(),
-    table.vaultUsdc.toBase58(),
-    configPda.toBase58(),
-    treasury.toBase58(),
-    randomPda.toBase58(),
-  ])
+  // Build instruction COMPLETELY MANUALLY to bypass IDL validation
+  // This is necessary because deployed program removed config/vrf but IDL still has them
   
-  ix.keys = ix.keys.map((k) => ({
-    ...k,
-    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
-    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
-  }))
+  // Discriminator is SHA256("global:place_bet")[0..8]
+  // sha256("global:place_bet") = de3e43dc3fa67e21...
+  const discriminator = Buffer.from([0xde, 0x3e, 0x43, 0xdc, 0x3f, 0xa6, 0x7e, 0x21])
+  
+  // Serialize bet kind (Borsh enum serialization: 1-byte variant + fields)
+  // Variants: Straight=0, Split=1, Street=2, Corner=3, SixLine=4, Red=5, Black=6, Even=7, Odd=8, Low=9, High=10, Dozen=11, Column=12
+  // Frontend passes: { straight: { number: 5 } }, { red: {} }, { split: { a: 1, b: 2 } }, etc.
+  let betData: Buffer
+  if (args.betKind.hasOwnProperty('straight')) {
+    // Straight variant (0) + u8 number
+    betData = Buffer.alloc(2)
+    betData[0] = 0
+    betData[1] = (args.betKind as any).straight.number
+  } else if (args.betKind.hasOwnProperty('split')) {
+    // Split variant (1) + u8 a + u8 b
+    betData = Buffer.alloc(3)
+    betData[0] = 1
+    betData[1] = (args.betKind as any).split.a
+    betData[2] = (args.betKind as any).split.b
+  } else if (args.betKind.hasOwnProperty('street')) {
+    // Street variant (2) + u8 row
+    betData = Buffer.alloc(2)
+    betData[0] = 2
+    betData[1] = (args.betKind as any).street.row
+  } else if (args.betKind.hasOwnProperty('corner')) {
+    // Corner variant (3) + u8 row + u8 col
+    betData = Buffer.alloc(3)
+    betData[0] = 3
+    betData[1] = (args.betKind as any).corner.row
+    betData[2] = (args.betKind as any).corner.col
+  } else if (args.betKind.hasOwnProperty('sixLine')) {
+    // SixLine variant (4) + u8 row
+    betData = Buffer.alloc(2)
+    betData[0] = 4
+    betData[1] = (args.betKind as any).sixLine.row
+  } else if (args.betKind.hasOwnProperty('red')) {
+    betData = Buffer.from([5]) // Red variant
+  } else if (args.betKind.hasOwnProperty('black')) {
+    betData = Buffer.from([6]) // Black variant
+  } else if (args.betKind.hasOwnProperty('even')) {
+    betData = Buffer.from([7]) // Even variant
+  } else if (args.betKind.hasOwnProperty('odd')) {
+    betData = Buffer.from([8]) // Odd variant
+  } else if (args.betKind.hasOwnProperty('low')) {
+    betData = Buffer.from([9]) // Low variant
+  } else if (args.betKind.hasOwnProperty('high')) {
+    betData = Buffer.from([10]) // High variant
+  } else if (args.betKind.hasOwnProperty('dozen')) {
+    // Dozen variant (11) + u8 idx
+    betData = Buffer.alloc(2)
+    betData[0] = 11
+    betData[1] = (args.betKind as any).dozen.idx
+  } else if (args.betKind.hasOwnProperty('column')) {
+    // Column variant (12) + u8 idx
+    betData = Buffer.alloc(2)
+    betData[0] = 12
+    betData[1] = (args.betKind as any).column.idx
+  } else {
+    throw new Error('Unknown bet kind')
+  }
+  
+  // Serialize stake (u64 LE)
+  const stakeBuf = Buffer.alloc(8)
+  stakeBuf.writeBigUInt64LE(BigInt(args.stake))
+  
+  // Serialize force ([u8; 32])
+  const forceBuf = Buffer.from(force)
+  
+  const data = Buffer.concat([discriminator, betData, stakeBuf, forceBuf])
+  
+  const ix = new anchor.web3.TransactionInstruction({
+    programId: program.programId,
+    keys: [
+      { pubkey: player, isSigner: true, isWritable: true },
+      { pubkey: playerUsdcAta, isSigner: false, isWritable: true },
+      { pubkey: args.table, isSigner: false, isWritable: true },
+      { pubkey: table.vaultUsdc, isSigner: false, isWritable: true },
+      { pubkey: betPda, isSigner: false, isWritable: true },
+      { pubkey: randomPda, isSigner: false, isWritable: true },
+      { pubkey: treasury, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data,
+  })
 
   const tx = new anchor.web3.Transaction().add(ix)
   tx.feePayer = player
@@ -503,17 +555,28 @@ export async function resolveBet(
 
   const random = bet.randomnessAccount
 
-  return program.rpc.resolveBet({
-    accounts: {
-      resolver,
-      table: args.table,
-      bet: args.bet,
-      playerUsdcAta,
-      vaultUsdc: table.vaultUsdc,
-      random,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    },
+  // Build instruction manually to force correct account metas and bypass IDL
+  // Discriminator for "global:resolve_bet"
+  // sha256("global:resolve_bet") = 8984216130d01e9f...
+  const discriminator = Buffer.from([0x89, 0x84, 0x21, 0x61, 0x30, 0xd0, 0x1e, 0x9f])
+
+  const ix = new anchor.web3.TransactionInstruction({
+    programId: program.programId,
+    keys: [
+      { pubkey: resolver, isSigner: true, isWritable: true },
+      { pubkey: args.table, isSigner: false, isWritable: true },
+      { pubkey: args.bet, isSigner: false, isWritable: true },
+      { pubkey: playerUsdcAta, isSigner: false, isWritable: true },
+      { pubkey: table.vaultUsdc, isSigner: false, isWritable: true },
+      { pubkey: random, isSigner: false, isWritable: true }, // random account
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data: discriminator
   })
+
+  const tx = new anchor.web3.Transaction().add(ix)
+  tx.feePayer = resolver
+  return provider.sendAndConfirm(tx, [])
 }
 
 export async function refundExpired(
