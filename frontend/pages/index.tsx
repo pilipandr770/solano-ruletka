@@ -359,13 +359,23 @@ export default function Home() {
                   console.log('resolveBet tx:', txSig)
                   
                   // Wait for confirmation and read result
-                  await new Promise(resolve => setTimeout(resolve, 2000))
-                  const betInfoAfter = await provider.connection.getAccountInfo(bet)
-                  if (betInfoAfter) {
-                    // Decode to get result_number
-                    // For now just alert success
-                    alert('Bet resolved! Check bet account or tx explorer for winning number.')
+                  await new Promise(resolve => setTimeout(resolve, 5000))
+                  
+                  try {
+                    const betData = await anchorLib.getBet(provider, bet)
+                    if (betData.resultNumber !== null) {
+                      const msg = `Result: ${betData.resultNumber}\n` +
+                                  (betData.payout > 0n ? `YOU WON! Payout: ${Number(betData.payout)/1e6} USDC` : 'You lost.')
+                      alert(msg)
+                      // Optional: Update some UI state to show the number
+                    } else {
+                      alert('Bet resolved but result not found yet. Try checking explorer.')
+                    }
+                  } catch (err) {
+                    console.error('Error fetching bet result:', err)
+                    alert('Bet resolved, but failed to fetch result.')
                   }
+
                 } catch (e: any) {
                   console.error(e)
                   alert('resolveBet failed: ' + (e?.message || e))

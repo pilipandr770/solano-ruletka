@@ -159,6 +159,9 @@ function betKindPayloadLen(tag: number): number {
 }
 
 function decodeBetAccount(data: Uint8Array): DecodedBet {
+  console.log('Raw BetAccount data len:', data.length)
+  console.log('Raw hex:', Buffer.from(data).toString('hex'))
+
   let o = skipAnchorDiscriminator(0)
 
   const table = readPubkey(data, o); o = table.next
@@ -169,10 +172,14 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
   const maxTotalPayout = readU64LE(data, o); o = maxTotalPayout.next
 
   const kindTag = readU8(data, o); o = kindTag.next
+  console.log('Decoded kindTag:', kindTag.value)
+  
   const payloadLen = betKindPayloadLen(kindTag.value)
+  console.log('Payload len:', payloadLen)
   o += payloadLen
 
   const state = readU8(data, o); o = state.next
+  console.log('Decoded state:', state.value)
 
   const createdTs = readI64LE(data, o); o = createdTs.next
 
@@ -181,10 +188,13 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
   const randomnessAccount = readPubkey(data, o); o = randomnessAccount.next
 
   const resultNumberOpt = readU8(data, o); o = resultNumberOpt.next
+  console.log('Decoded resultNumberOpt:', resultNumberOpt.value)
+  
   let resultNumber: number | null = null
   if (resultNumberOpt.value === 1) {
       const rn = readU8(data, o); o = rn.next
       resultNumber = rn.value
+      console.log('Decoded resultNumber:', resultNumber)
   }
 
   return {
@@ -610,6 +620,15 @@ export async function refundExpired(
   })
 }
 
+export async function getBet(
+  provider: anchor.AnchorProvider,
+  betPda: PublicKey
+): Promise<DecodedBet> {
+  const info = await provider.connection.getAccountInfo(betPda)
+  if (!info?.data) throw new Error('Bet account not found')
+  return decodeBetAccount(info.data)
+}
+
 export default {
   initProgram,
   createTable,
@@ -617,4 +636,5 @@ export default {
   placeBet,
   resolveBet,
   refundExpired,
+  getBet,
 }
