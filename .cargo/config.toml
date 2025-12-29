@@ -1,0 +1,8 @@
+[patch."https://github.com/rust-lang/crates.io-index"]
+# Pin rustc-1.79-compatible versions
+indexmap = { path = "/mnt/c/Users/ПК/solano_ruletka/vendor/indexmap-2.0.0" }
+toml_edit = { path = "/mnt/c/Users/ПК/solano_ruletka/vendor/toml_edit-0.21.0" }
+proc-macro-crate = { path = "/mnt/c/Users/ПК/solano_ruletka/vendor/proc-macro-crate-3.1.0" }
+
+[net]
+git-fetch-with-cli = true

@@ -1,6 +1,7 @@
 ﻿import { useCallback, useEffect, useState } from 'react'
 import Head from 'next/head'
 import { PublicKey, Connection } from '@solana/web3.js'
+import * as anchor from '@coral-xyz/anchor'
 import anchorLib from '../lib/anchor'
 import dynamic from 'next/dynamic'
 import { getAssociatedTokenAddress } from '@solana/spl-token'
@@ -97,32 +98,13 @@ export default function Home() {
   const handleCreateTable = useCallback(async () => {
     try {
       const { program } = await ensureProgram()
-      const res = await anchorLib.createTable(program, publicKey as PublicKey, { seed: Math.floor(Math.random()*1e6), usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string, govMint: process.env.NEXT_PUBLIC_GOV_MINT as string, minBet: 1, maxBet: 1000000 })
+      const seed = Math.floor(Math.random() * 1e6)
+      const res = await anchorLib.createTable(program, publicKey as PublicKey, { seed, usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string, govMint: process.env.NEXT_PUBLIC_GOV_MINT as string, minBet: 1, maxBet: 1000000 })
       console.log('createTable', res)
-      alert('createTable sent')
-    } catch(e:any) { console.error(e); alert(e?.message||e) }
-  }, [publicKey, connection])
-
-  const handlePlaceBet = useCallback(async () => {
-    try {
-      const { program } = await ensureProgram()
-      const player = publicKey as PublicKey
-      if (!process.env.NEXT_PUBLIC_PROGRAM_ID) throw new Error('NEXT_PUBLIC_PROGRAM_ID not set')
-      if (!process.env.NEXT_PUBLIC_USDC_MINT) throw new Error('NEXT_PUBLIC_USDC_MINT not set')
-      console.log('Creating table PublicKey from:', process.env.NEXT_PUBLIC_PROGRAM_ID)
-      let table: PublicKey
-      try { table = new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID as string) } catch (err) { console.error('Invalid NEXT_PUBLIC_PROGRAM_ID', process.env.NEXT_PUBLIC_PROGRAM_ID, err); throw new Error('Invalid NEXT_PUBLIC_PROGRAM_ID') }
-      console.log('Creating usdcMint PublicKey from:', process.env.NEXT_PUBLIC_USDC_MINT)
-      let usdcMint: PublicKey
-      try { usdcMint = new PublicKey(process.env.NEXT_PUBLIC_USDC_MINT as string) } catch (err) { console.error('Invalid USDC mint', process.env.NEXT_PUBLIC_USDC_MINT, err); throw new Error('Invalid NEXT_PUBLIC_USDC_MINT') }
-      const playerUsdcAta = await getAssociatedTokenAddress(usdcMint, player)
-      try {
-        const res = await anchorLib.placeBet(program, player, playerUsdcAta, table, { straight: 7 }, 1)
-        console.log('placeBet', res); alert('placeBet sent')
-      } catch (err:any) {
-        console.error('placeBet rpc failed', { player: player.toBase58(), playerUsdcAta: playerUsdcAta.toBase58(), table: table.toBase58() }, err)
-        throw err
-      }
+      // Calculate table PDA
+      const [tablePda] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('table'), (publicKey as PublicKey).toBuffer(), new anchor.BN(seed).toArrayLike(Buffer, 'le', 8)], new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID as string))
+      setTableAddress(tablePda.toBase58())
+      alert('createTable sent, table address set')
     } catch(e:any) { console.error(e); alert(e?.message||e) }
   }, [publicKey, connection])
 
@@ -132,7 +114,8 @@ export default function Home() {
   const [selectedStreet, setSelectedStreet] = useState<number[] | null>(null)
   const [betType, setBetType] = useState<'straight'|'split'|'street'|'corner'|'red'|'black'|'dozen'|'column'>('straight')
   const [stake, setStake] = useState<number>(1)
-  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || process.env.NEXT_PUBLIC_PROGRAM_ID || '')
+  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
+  const [tableSeed, setTableSeed] = useState<number>(Math.floor(Math.random() * 1e6))
   const [betSlip, setBetSlip] = useState<Array<any>>([])
 
   async function handlePlaceBetUI() {
@@ -141,10 +124,15 @@ export default function Home() {
     if (betType === 'split' && (!selectedPair || selectedPair[0] === selectedPair[1])) return alert('Select two adjacent numbers for split')
     if (betType === 'split' && selectedCorner) return alert('For corner bets switch bet type to corner (handled via buttons)')
     if (betType === 'street' && (!selectedStreet || selectedStreet.length !== 3)) return alert('Select a street (row of 3 numbers)')
+    if (betType === 'corner' && (!selectedCorner || selectedCorner.length !== 4)) return alert('Select a valid corner (4 numbers)')
+    if ((betType === 'dozen' || betType === 'column') && selectedNumber === null) return alert('Select a dozen/column first')
     try {
       const { program } = await ensureProgram()
       const player = publicKey as PublicKey
-      if (!tableAddress) return alert('Set table address in the input above')
+      if (!tableAddress) return alert('Set table address in the Table section above')
+      if (process.env.NEXT_PUBLIC_PROGRAM_ID && tableAddress === process.env.NEXT_PUBLIC_PROGRAM_ID) {
+        return alert('Table address is ProgramId. Create/select a real table PDA address.')
+      }
       let table: PublicKey
       try { table = new PublicKey(tableAddress) } catch { return alert('Invalid table address') }
       // derive player's USDC ATA
@@ -152,14 +140,14 @@ export default function Home() {
       const usdcMint = new PublicKey(process.env.NEXT_PUBLIC_USDC_MINT as string)
       const playerUsdcAta = await getAssociatedTokenAddress(usdcMint, player)
       let betKind: any = null
-      if (betType === 'straight') betKind = { straight: selectedNumber }
-      else if (betType === 'split') betKind = { split: selectedPair }
-      else if (betType === 'street') betKind = { street: selectedStreet }
-      else if (betType === 'corner') betKind = { corner: selectedCorner }
-      else if (betType === 'red') betKind = { red: true }
-      else if (betType === 'black') betKind = { black: true }
-      else if (betType === 'dozen') betKind = { dozen: selectedNumber } // selectedNumber used to preview which dozen
-      else if (betType === 'column') betKind = { column: selectedNumber }
+      if (betType === 'straight') betKind = { straight: { number: selectedNumber } }
+      else if (betType === 'split') betKind = { split: { a: selectedPair[0], b: selectedPair[1] } }
+      else if (betType === 'street') betKind = { street: { row: Math.floor((selectedStreet[0] - 1) / 3) } } // assuming rows 0-11
+      else if (betType === 'corner') betKind = { corner: { row: Math.floor((selectedCorner[0] - 1) / 3), col: (selectedCorner[0] - 1) % 3 } } // rough
+      else if (betType === 'red') betKind = { red: {} }
+      else if (betType === 'black') betKind = { black: {} }
+      else if (betType === 'dozen') betKind = { dozen: { idx: selectedNumber } }
+      else if (betType === 'column') betKind = { column: { idx: selectedNumber } }
       const res = await anchorLib.placeBet(program, player, playerUsdcAta, table, betKind, stake)
       console.log('placeBet result', res)
       alert('placeBet transaction sent (see console)')
@@ -199,14 +187,15 @@ export default function Home() {
       const playerUsdcAta = await getAssociatedTokenAddress(usdcMint, player)
       for (const b of betSlip) {
         let betKind: any = null
-        if (b.type === 'straight') betKind = { straight: b.value }
-        else if (b.type === 'split') betKind = { split: b.value }
-        else if (b.type === 'street') betKind = { street: b.value }
-        else if (b.type === 'corner') betKind = { corner: b.value }
-        else if (b.type === 'red') betKind = { red: true }
-        else if (b.type === 'black') betKind = { black: true }
-        else if (b.type === 'dozen') betKind = { dozen: b.value }
-        else if (b.type === 'column') betKind = { column: b.value }
+        if (b.type === 'straight') betKind = { straight: { number: b.value } }
+        else if (b.type === 'split') betKind = { split: { a: b.value[0], b: b.value[1] } }
+        else if (b.type === 'street') betKind = { street: { row: Math.floor((b.value[0] - 1) / 3) } }
+        else if (b.type === 'corner') betKind = { corner: { row: Math.floor((b.value[0] - 1) / 3), col: (b.value[0] - 1) % 3 } }
+        else if (b.type === 'red') betKind = { red: {} }
+        else if (b.type === 'black') betKind = { black: {} }
+        else if (b.type === 'dozen') betKind = { dozen: { idx: b.value } }
+        else if (b.type === 'column') betKind = { column: { idx: b.value } }
+        if (!betKind) throw new Error('Invalid bet in slip: ' + JSON.stringify(b))
         try {
           await anchorLib.placeBet(program, player, playerUsdcAta, table, betKind, b.stake)
         } catch (err:any) {
@@ -246,6 +235,59 @@ export default function Home() {
           <div>RPC: {rpcUrl}</div>
           <div>Wallet: {publicKey ? publicKey.toBase58() : 'Not connected'}</div>
           <div>SOL: {balance!==null?balance.toFixed(4):''}</div>
+        </section>
+
+        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
+          <h2>Table</h2>
+          <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
+            <label style={{display:'flex',gap:8,alignItems:'center'}}>
+              Table number (seed):
+              <input
+                type="number"
+                value={tableSeed}
+                onChange={(e)=>setTableSeed(Number(e.target.value||0))}
+                style={{width:160}}
+              />
+            </label>
+            <button onClick={async ()=>{
+              try {
+                if (!publicKey) return alert('Connect wallet first')
+                const { program } = await ensureProgram()
+                const seed = Number.isFinite(tableSeed) ? Math.floor(tableSeed) : Math.floor(Math.random()*1e6)
+                const res = await anchorLib.createTable(program, publicKey as PublicKey, {
+                  seed,
+                  usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string,
+                  govMint: process.env.NEXT_PUBLIC_GOV_MINT as string,
+                  minBet: 1,
+                  maxBet: 1000000,
+                })
+                console.log('createTable tx', res)
+                if (!process.env.NEXT_PUBLIC_PROGRAM_ID) throw new Error('NEXT_PUBLIC_PROGRAM_ID is missing')
+                const [tablePda] = anchor.web3.PublicKey.findProgramAddressSync(
+                  [Buffer.from('table'), (publicKey as PublicKey).toBuffer(), new anchor.BN(seed).toArrayLike(Buffer, 'le', 8)],
+                  new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID as string)
+                )
+                setTableAddress(tablePda.toBase58())
+                alert('createTable sent, table PDA set')
+              } catch (e:any) {
+                console.error(e)
+                alert('createTable failed: ' + (e?.message || e))
+              }
+            }}>Create Table</button>
+          </div>
+
+          <div style={{marginTop:12}}>
+            <label style={{display:'block',marginBottom:6}}>Table address (PDA)</label>
+            <input
+              value={tableAddress}
+              onChange={(e)=>setTableAddress(e.target.value.trim())}
+              placeholder="Paste table PDA here, or click Create Table"
+              style={{width:'100%'}}
+            />
+            <div style={{marginTop:8, color:'#666', fontSize:13}}>
+              Multiple tables are supported by choosing a different seed; each (creator, seed) maps to a unique PDA address.
+            </div>
+          </div>
         </section>
 
         <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>

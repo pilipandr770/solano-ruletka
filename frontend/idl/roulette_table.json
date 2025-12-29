@@ -17,7 +17,7 @@
       ],
       "args": [
         {"name":"seed","type":"u64"},
-        {"name":"mode","type":{"defined":"TableMode"}},
+        {"name":"mode","type":"u8"},
         {"name":"minBet","type":"u64"},
         {"name":"maxBet","type":"u64"}
       ]
@@ -48,7 +48,7 @@
         {"name":"systemProgram","isMut":false,"isSigner":false},
         {"name":"tokenProgram","isMut":false,"isSigner":false}
       ],
-      "args": [{"name":"betKind","type":{"defined":"BetKind"}},{"name":"stake","type":"u64"},{"name":"force","type":{"array":"u8","len":32}}]
+      "args": [{"name":"betKind","type":{"defined":{"name":"betKind"}}},{"name":"stake","type":"u64"},{"name":"force","type":{"array":["u8",32]}}]
     },
     {
       "name": "resolveBet",
@@ -115,7 +115,7 @@
         {"name":"operator","isMut":true,"isSigner":true},
         {"name":"table","isMut":true,"isSigner":false}
       ],
-      "args": [{"name":"mode","type":{"defined":"TableMode"}}]
+      "args": [{"name":"mode","type":{"defined":{"name":"tableMode"}}}]
     },
     {
       "name": "pause",
@@ -145,16 +145,36 @@
     }
   ],
   "types": [
-    {"name":"TableMode","type":{"kind":"enum","variants":[{"name":"Private"},{"name":"Public"}]}},
-    {"name":"BetKind","type":{"kind":"enum","variants":[
-      {"name":"Straight","fields":[{"name":"number","type":"u8"}]},
-      {"name":"Split","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]},
-      {"name":"Street","fields":[{"name":"row","type":"u8"}]},
-      {"name":"Corner","fields":[{"name":"row","type":"u8"},{"name":"col","type":"u8"}]},
-      {"name":"SixLine","fields":[{"name":"row","type":"u8"}]},
-      {"name":"Red"},{"name":"Black"},{"name":"Even"},{"name":"Odd"},{"name":"Low"},{"name":"High"},
-      {"name":"Dozen","fields":[{"name":"idx","type":"u8"}]},
-      {"name":"Column","fields":[{"name":"idx","type":"u8"}]}
-    ]}}
+    {
+      "name":"tableMode",
+      "type":{
+        "kind":"enum",
+        "variants":[
+          {"name":"private"},
+          {"name":"public"}
+        ]
+      }
+    },
+    {
+      "name":"betKind",
+      "type":{
+        "kind":"enum",
+        "variants":[
+          {"name":"Straight","fields":[{"name":"number","type":"u8"}]},
+          {"name":"Split","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]},
+          {"name":"Street","fields":[{"name":"row","type":"u8"}]},
+          {"name":"Corner","fields":[{"name":"row","type":"u8"},{"name":"col","type":"u8"}]},
+          {"name":"SixLine","fields":[{"name":"row","type":"u8"}]},
+          {"name":"Red"},
+          {"name":"Black"},
+          {"name":"Even"},
+          {"name":"Odd"},
+          {"name":"Low"},
+          {"name":"High"},
+          {"name":"Dozen","fields":[{"name":"idx","type":"u8"}]},
+          {"name":"Column","fields":[{"name":"idx","type":"u8"}]}
+        ]
+      }
+    }
   ]
 }

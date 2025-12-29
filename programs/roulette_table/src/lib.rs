@@ -3,15 +3,14 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 use orao_solana_vrf::{
     cpi as orao_cpi,
-    state::NetworkState,
-    RandomnessAccountData,
+    state::{NetworkState, RandomnessAccountData},
     CONFIG_ACCOUNT_SEED,
     RANDOMNESS_ACCOUNT_SEED,
 };
 
 use std::str::FromStr;
 
-declare_id!("Rou1eTTes111111111111111111111111111111111");
+declare_id!("AV5r5GYG7adU9q1ojmyawExGtx2BAAqhtWa2AAXLNVa8");
 
 pub const GOV_TOTAL_SUPPLY: u64 = 100;
 pub const OPERATOR_THRESHOLD: u64 = 51;
@@ -102,14 +101,16 @@ pub mod roulette_table {
         dep.amount -= amount;
 
         // PDA signer: control_vault_gov owner = table PDA
-        let signer_seeds = table_signer_seeds!(table);
+        let seed_bytes = table.seed.to_le_bytes();
+        let bump = [table.bumps.table];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
         let cpi_accounts = Transfer {
             from: ctx.accounts.control_vault_gov.to_account_info(),
             to: ctx.accounts.depositor_gov_ata.to_account_info(),
-            authority: ctx.accounts.table.to_account_info(),
+            authority: table.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, &[signer_seeds]);
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
         token::transfer(cpi_ctx, amount)?;
 
         Ok(())
@@ -190,14 +191,16 @@ pub mod roulette_table {
             table.withdraw_request_ts = 0;
         }
 
-        let signer_seeds = table_signer_seeds!(table);
+        let seed_bytes = table.seed.to_le_bytes();
+        let bump = [table.bumps.table];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
         let cpi_accounts = Transfer {
             from: ctx.accounts.vault_usdc.to_account_info(),
             to: ctx.accounts.operator_usdc_ata.to_account_info(),
-            authority: ctx.accounts.table.to_account_info(),
+            authority: table.to_account_info(),
         };
         let cpi_ctx =
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, &[signer_seeds]);
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
         token::transfer(cpi_ctx, amount)?;
 
         Ok(())
@@ -288,16 +291,18 @@ pub mod roulette_table {
         };
 
         if total_payout > 0 {
-            let signer_seeds = table_signer_seeds!(table);
+            let seed_bytes = table.seed.to_le_bytes();
+            let bump = [table.bumps.table];
+            let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
             let cpi_accounts = Transfer {
                 from: ctx.accounts.vault_usdc.to_account_info(),
                 to: ctx.accounts.player_usdc_ata.to_account_info(),
-                authority: ctx.accounts.table.to_account_info(),
+                authority: table.to_account_info(),
             };
             let cpi_ctx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 cpi_accounts,
-                &[signer_seeds],
+                signer_seeds,
             );
             token::transfer(cpi_ctx, total_payout)?;
         }
@@ -323,16 +328,18 @@ pub mod roulette_table {
             RouletteError::BetNotExpired
         );
 
-        let signer_seeds = table_signer_seeds!(table);
+        let seed_bytes = table.seed.to_le_bytes();
+        let bump = [table.bumps.table];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
         let cpi_accounts = Transfer {
             from: ctx.accounts.vault_usdc.to_account_info(),
             to: ctx.accounts.player_usdc_ata.to_account_info(),
-            authority: ctx.accounts.table.to_account_info(),
+            authority: table.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             cpi_accounts,
-            &[signer_seeds],
+            signer_seeds,
         );
         token::transfer(cpi_ctx, bet.stake)?;
 
@@ -706,14 +713,9 @@ impl BetKind {
 
 #[macro_export]
 macro_rules! table_signer_seeds {
-    ($table:expr) => {
-        &[
-            b"table",
-            $table.creator.as_ref(),
-            &$table.seed.to_le_bytes(),
-            &[$table.bumps.table],
-        ][..]
-    };
+    ($table:expr) => {{
+        &[ &[ b"table", $table.creator.as_ref(), &$table.seed.to_le_bytes(), &[$table.bumps.table] ] ]
+    }};
 }
 
 fn roulette_number_from_randomness(rnd: &[u8; 64]) -> u8 {
