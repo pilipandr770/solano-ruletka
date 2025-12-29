@@ -346,15 +346,36 @@ export async function depositLiquidity(
     program.programId
   )
 
-  return program.rpc.depositLiquidityUsdc(new anchor.BN(args.amount), {
-    accounts: {
+  // Build instruction manually to force correct account metas
+  const ix = await program.methods
+    .depositLiquidityUsdc(new anchor.BN(args.amount))
+    .accounts({
       operator,
       operatorUsdcAta,
       table: args.table,
       vaultUsdc,
       tokenProgram: TOKEN_PROGRAM_ID,
-    },
-  })
+    })
+    .instruction()
+
+  // Force signer/writable flags
+  const signerSet = new Set<string>([operator.toBase58()])
+  const writableSet = new Set<string>([
+    operator.toBase58(),
+    operatorUsdcAta.toBase58(),
+    args.table.toBase58(),
+    vaultUsdc.toBase58(),
+  ])
+  
+  ix.keys = ix.keys.map((k) => ({
+    ...k,
+    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
+    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
+  }))
+
+  const tx = new anchor.web3.Transaction().add(ix)
+  tx.feePayer = operator
+  return provider.sendAndConfirm(tx, [])
 }
 
 export async function placeBet(
@@ -407,26 +428,46 @@ export async function placeBet(
   const playerUsdcAta =
     args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMint, player)
 
-  const txSig = await program.rpc.placeBet(
-    new anchor.BN(args.stake),
-    force,
-    args.betKind,
-    {
-      accounts: {
-        player,
-        table: args.table,
-        bet: betPda,
-        playerUsdcAta,
-        vaultUsdc: table.vaultUsdc,
-        config: configPda,
-        treasury,
-        random: randomPda,
-        vrf: ORAO_VRF_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      },
-    }
-  )
+  // Build instruction manually to force correct account metas
+  const ix = await program.methods
+    .placeBet(args.betKind, new anchor.BN(args.stake), Array.from(force))
+    .accounts({
+      player,
+      table: args.table,
+      bet: betPda,
+      playerUsdcAta,
+      vaultUsdc: table.vaultUsdc,
+      config: configPda,
+      treasury,
+      random: randomPda,
+      vrf: ORAO_VRF_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .instruction()
+
+  // Force signer/writable flags (IDL lacks account metadata)
+  const signerSet = new Set<string>([player.toBase58()])
+  const writableSet = new Set<string>([
+    player.toBase58(),
+    args.table.toBase58(),
+    betPda.toBase58(),
+    playerUsdcAta.toBase58(),
+    table.vaultUsdc.toBase58(),
+    configPda.toBase58(),
+    treasury.toBase58(),
+    randomPda.toBase58(),
+  ])
+  
+  ix.keys = ix.keys.map((k) => ({
+    ...k,
+    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
+    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
+  }))
+
+  const tx = new anchor.web3.Transaction().add(ix)
+  tx.feePayer = player
+  const txSig = await provider.sendAndConfirm(tx, [])
 
   return {
     txSig,

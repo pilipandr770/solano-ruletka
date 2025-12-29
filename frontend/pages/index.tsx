@@ -257,12 +257,22 @@ export default function Home() {
                 })
                 console.log('createTable tx', res)
                 if (!process.env.NEXT_PUBLIC_PROGRAM_ID) throw new Error('NEXT_PUBLIC_PROGRAM_ID is missing')
-                const [tablePda] = anchor.web3.PublicKey.findProgramAddressSync(
-                  [Buffer.from('table'), (publicKey as PublicKey).toBuffer(), new anchor.BN(seed).toArrayLike(Buffer, 'le', 8)],
-                  new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID as string)
-                )
-                setTableAddress(tablePda.toBase58())
-                alert('createTable sent, table PDA set')
+                const tablePda = res.tablePda
+                setTableAddress(tablePda)
+                
+                // Wait for account to be created on-chain
+                console.log('Waiting for table account to be created...')
+                let attempts = 0
+                while (attempts < 10) {
+                  await new Promise(resolve => setTimeout(resolve, 1000))
+                  const info = await connection.getAccountInfo(new PublicKey(tablePda))
+                  if (info) {
+                    alert('Table created successfully! Address: ' + tablePda)
+                    return
+                  }
+                  attempts++
+                }
+                alert('Table tx sent but account not yet visible. Address: ' + tablePda)
               } catch (e:any) {
                 console.error(e)
                 alert('createTable failed: ' + (e?.message || e))
@@ -280,6 +290,35 @@ export default function Home() {
             />
             <div style={{marginTop:8, color:'#666', fontSize:13}}>
               Multiple tables are supported by choosing a different seed; each (creator, seed) maps to a unique PDA address.
+            </div>
+          </div>
+
+          <div style={{marginTop:16,padding:12,background:'#fff3cd',borderRadius:6}}>
+            <h3 style={{margin:'0 0 8px 0',fontSize:15}}>Deposit Liquidity (Required before bets)</h3>
+            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+              <input
+                type="number"
+                placeholder="Amount (USDC)"
+                id="liquidityAmount"
+                style={{width:150}}
+                defaultValue={1000}
+              />
+              <button onClick={async ()=>{
+                try {
+                  if (!publicKey) return alert('Connect wallet first')
+                  if (!tableAddress) return alert('Set table address first')
+                  const { program, provider } = await ensureProgram()
+                  const amount = Number((document.getElementById('liquidityAmount') as HTMLInputElement)?.value || 0)
+                  if (!amount || amount <= 0) return alert('Enter valid amount')
+                  const table = new PublicKey(tableAddress)
+                  await anchorLib.depositLiquidity(program, provider, { table, amount })
+                  alert('Liquidity deposited successfully!')
+                } catch (e: any) {
+                  console.error(e)
+                  alert('depositLiquidity failed: ' + (e?.message || e))
+                }
+              }}>Deposit Liquidity</button>
+              <span style={{fontSize:13,color:'#856404'}}>Operators must fund the vault before players can bet</span>
             </div>
           </div>
         </section>
