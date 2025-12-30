@@ -119,6 +119,7 @@ export default function Home() {
   const [tableSeed, setTableSeed] = useState<number>(Math.floor(Math.random() * 1e6))
   const [betSlip, setBetSlip] = useState<Array<any>>([])
   const [lastBetPda, setLastBetPda] = useState<string>('')
+  const [lastResult, setLastResult] = useState<{number: number, win: boolean, payout: number} | null>(null)
 
   async function handlePlaceBetUI() {
     if (!publicKey) return alert('Connect wallet first')
@@ -327,6 +328,21 @@ export default function Home() {
 
         <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
           <h2>Resolve Bet (Spin Roulette)</h2>
+          {lastResult && (
+            <div style={{
+              marginBottom: 12, 
+              padding: 10, 
+              borderRadius: 6, 
+              background: lastResult.win ? '#d4edda' : '#f8d7da',
+              color: lastResult.win ? '#155724' : '#721c24',
+              border: `1px solid ${lastResult.win ? '#c3e6cb' : '#f5c6cb'}`,
+              textAlign: 'center',
+              fontWeight: 'bold',
+              fontSize: 18
+            }}>
+              SPIN RESULT: {lastResult.number} — {lastResult.win ? `WON ${lastResult.payout} USDC` : 'LOST'}
+            </div>
+          )}
           <div style={{padding:12,background:'#d1ecf1',borderRadius:6}}>
             <p style={{margin:'0 0 12px 0',fontSize:14}}>
               After placing a bet, wait ~5-10 seconds for ORAO VRF to fulfill randomness, then resolve to get the winning number and payout.
@@ -363,13 +379,35 @@ export default function Home() {
                   
                   try {
                     const betData = await anchorLib.getBet(provider, bet)
-                    if (betData.resultNumber !== null) {
+                    console.log('Bet state after resolve:', betData.isSettled ? 'Settled' : 'Pending', betData.resultNumber)
+                    
+                    if (betData.isSettled && betData.resultNumber !== null) {
+                      const win = betData.payout > 0n
                       const msg = `Result: ${betData.resultNumber}\n` +
-                                  (betData.payout > 0n ? `YOU WON! Payout: ${Number(betData.payout)/1e6} USDC` : 'You lost.')
+                                  (win ? `YOU WON! Payout: ${Number(betData.payout)/1e6} USDC` : 'You lost.')
                       alert(msg)
-                      // Optional: Update some UI state to show the number
+                      // Update UI with result
+                      setLastResult({ number: betData.resultNumber, win, payout: Number(betData.payout)/1e6 })
                     } else {
-                      alert('Bet resolved but result not found yet. Try checking explorer.')
+                      // If still pending, check transaction status
+                      console.log('Bet still pending. Checking transaction...')
+                      try {
+                        const tx = await provider.connection.getTransaction(txSig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
+                        console.log('Transaction details:', tx)
+                        
+                        if (tx && tx.meta && tx.meta.err) {
+                          alert('Resolve transaction FAILED! See console for logs.')
+                          console.error('Transaction error:', tx.meta.err)
+                          console.log('Transaction logs:', tx.meta.logMessages)
+                        } else if (tx) {
+                          alert('Transaction success but account not updated? This is rare. Check explorer.')
+                        } else {
+                          alert('Transaction not found yet. Solana might be congested.')
+                        }
+                      } catch (txErr) {
+                        console.error('Error fetching transaction:', txErr)
+                        alert('Could not fetch transaction details.')
+                      }
                     }
                   } catch (err) {
                     console.error('Error fetching bet result:', err)
@@ -390,6 +428,23 @@ export default function Home() {
 
         <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
           <h2>Place a bet</h2>
+          {lastResult && (
+            <div style={{
+              marginBottom: 20, 
+              padding: 15, 
+              borderRadius: 8, 
+              background: lastResult.win ? '#d4edda' : '#f8d7da',
+              color: lastResult.win ? '#155724' : '#721c24',
+              border: `1px solid ${lastResult.win ? '#c3e6cb' : '#f5c6cb'}`
+            }}>
+              <h3 style={{margin:0}}>Last Spin Result: {lastResult.number}</h3>
+              <p style={{margin:'5px 0 0'}}>
+                {lastResult.win 
+                  ? `YOU WON! Payout: ${lastResult.payout} USDC` 
+                  : 'You lost.'}
+              </p>
+            </div>
+          )}
           <div style={{display:'flex',gap:24,alignItems:'flex-start',flexWrap:'wrap'}}>
             <div>
               {/* Bet-type buttons removed — the board itself handles bet selection */}
