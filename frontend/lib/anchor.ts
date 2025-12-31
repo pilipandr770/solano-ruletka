@@ -46,7 +46,7 @@ export async function getOraoRandomnessV2Fulfilled(
   if (data.length < ORAO_RANDOMNESS_V2_LEN_FULFILLED) return { fulfilled: false }
 
   const randomnessOffset = 8 + 1 + 32 + 32
-  const rnd = data.slice(randomnessOffset, randomnessOffset + 64)
+  const rnd = Uint8Array.from(data.slice(randomnessOffset, randomnessOffset + 64))
   return { fulfilled: true, randomness: rnd }
 }
 
@@ -253,9 +253,6 @@ function betCoversNumber(kindTag: number, payload: number[], n: number): boolean
 }
 
 function decodeBetAccount(data: Uint8Array): DecodedBet {
-  console.log('Raw BetAccount data len:', data.length)
-  console.log('Raw hex:', Buffer.from(data).toString('hex'))
-
   let o = skipAnchorDiscriminator(0)
 
   const table = readPubkey(data, o); o = table.next
@@ -266,10 +263,8 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
   const maxTotalPayout = readU64LE(data, o); o = maxTotalPayout.next
 
   const kindTag = readU8(data, o); o = kindTag.next
-  console.log('Decoded kindTag:', kindTag.value)
 
   const payloadLen = betKindPayloadLen(kindTag.value)
-  console.log('Payload len:', payloadLen)
   const kindPayload: number[] = []
   for (let i = 0; i < payloadLen; i++) {
     kindPayload.push(data[o + i])
@@ -277,7 +272,6 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
   o += payloadLen
 
   const state = readU8(data, o); o = state.next
-  console.log('Decoded state:', state.value)
 
   const createdTs = readI64LE(data, o); o = createdTs.next
 
@@ -286,13 +280,11 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
   const randomnessAccount = readPubkey(data, o); o = randomnessAccount.next
 
   const resultNumberOpt = readU8(data, o); o = resultNumberOpt.next
-  console.log('Decoded resultNumberOpt:', resultNumberOpt.value)
   
   let resultNumber: number | null = null
   if (resultNumberOpt.value === 1) {
       const rn = readU8(data, o); o = rn.next
       resultNumber = rn.value
-      console.log('Decoded resultNumber:', resultNumber)
   }
 
   // We don't persist payout on-chain; compute it from (stake, multiplier, kind, resultNumber)
@@ -329,11 +321,23 @@ function toSnakeCase(name: string): string {
   return name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toLowerCase()
 }
 
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+function isGlobalStateAccount(data: Uint8Array): boolean {
+  if (data.length < 8) return false
+  const expected = sha256(new TextEncoder().encode('account:GlobalState')).slice(0, 8)
+  return bytesEq(data.slice(0, 8), expected)
+}
+
 function withInstructionDiscriminators(rawIdl: any): any {
   const instructions = (rawIdl?.instructions || []).map((ix: any) => {
     if (Array.isArray(ix?.discriminator) && ix.discriminator.length === 8) return ix
     const snakeName = toSnakeCase(ix.name)
-    const preimage = Buffer.from(`global:${snakeName}`)
+    const preimage = new TextEncoder().encode(`global:${snakeName}`)
     const disc = Array.from(sha256(preimage).slice(0, 8))
     return { ...ix, discriminator: disc }
   })
@@ -411,7 +415,25 @@ async function ensureGlobalInitialized(
   const { globalState, globalVaultUsdc } = deriveGlobalStatePdas(program.programId, usdcMint)
 
   const info = await provider.connection.getAccountInfo(globalState, 'confirmed')
-  if (info) return { globalState, globalVaultUsdc }
+  if (info) {
+    const data = Uint8Array.from(info.data)
+    // If account exists but discriminator doesn't match (old upgrade), repair in-place.
+    if (!isGlobalStateAccount(data)) {
+      await program.methods
+        .repairGlobal()
+        .accounts({
+          payer,
+          usdcMint,
+          globalState,
+          globalVaultUsdc,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .rpc()
+    }
+    return { globalState, globalVaultUsdc }
+  }
 
   await program.methods
     .initGlobal()
@@ -498,6 +520,7 @@ export async function depositLiquidity(
     table: PublicKey
     amount: number
     operatorUsdcAta?: PublicKey
+    operatorGovAta?: PublicKey
   }
 ) {
   const operator = provider.wallet.publicKey
@@ -507,6 +530,10 @@ export async function depositLiquidity(
   const operatorUsdcAta =
     args.operatorUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, operator)
 
+  const govMintPk = new PublicKey(tableAcc.govMint)
+  const operatorGovAta =
+    args.operatorGovAta ?? getAssociatedTokenAddressSync(govMintPk, operator)
+
   const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
   return program.methods
@@ -514,6 +541,45 @@ export async function depositLiquidity(
     .accounts({
       operator,
       operatorUsdcAta,
+      table: args.table,
+      operatorGovAta,
+      globalState,
+      globalVaultUsdc,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .rpc()
+}
+
+export async function executeWithdraw(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  args: {
+    table: PublicKey
+    amount: number
+    operatorUsdcAta?: PublicKey
+    operatorGovAta?: PublicKey
+  }
+) {
+  const operator = provider.wallet.publicKey
+
+  const tableAcc: any = await (program.account as any).table.fetch(args.table)
+  const usdcMintPk = new PublicKey(tableAcc.usdcMint)
+  const operatorUsdcAta =
+    args.operatorUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, operator)
+
+  const govMintPk = new PublicKey(tableAcc.govMint)
+  const operatorGovAta =
+    args.operatorGovAta ?? getAssociatedTokenAddressSync(govMintPk, operator)
+
+  const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
+
+  return program.methods
+    .executeWithdraw(new anchor.BN(args.amount))
+    .accounts({
+      operator,
+      operatorUsdcAta,
+      table: args.table,
+      operatorGovAta,
       globalState,
       globalVaultUsdc,
       tokenProgram: TOKEN_PROGRAM_ID,
@@ -650,7 +716,7 @@ export async function refundExpired(
 
   const tableInfo = await provider.connection.getAccountInfo(args.table)
   if (!tableInfo?.data) throw new Error('Table account not found')
-  const table = decodeTableAccount(tableInfo.data)
+  const table = decodeTableAccount(Uint8Array.from(tableInfo.data))
 
   const playerUsdcAta =
     args.playerUsdcAta ?? getAssociatedTokenAddressSync(table.usdcMint, player)
@@ -674,7 +740,7 @@ export async function getBet(
 ): Promise<DecodedBet> {
   const info = await provider.connection.getAccountInfo(betPda, commitment)
   if (!info?.data) throw new Error('Bet account not found')
-  return decodeBetAccount(info.data)
+  return decodeBetAccount(Uint8Array.from(info.data))
 }
 
 export default {
@@ -684,6 +750,7 @@ export default {
   getOraoRandomnessV2Fulfilled,
   createTable,
   depositLiquidity,
+  executeWithdraw,
   placeBet,
   resolveBet,
   refundExpired,

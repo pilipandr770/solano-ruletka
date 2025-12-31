@@ -3,6 +3,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_lang::solana_program::{program::invoke, system_instruction};
 
 // ORAO VRF CPI
 use orao_solana_vrf::{
@@ -76,6 +77,67 @@ pub mod roulette_table {
             global: ctx.bumps.global_state,
             vault_usdc: ctx.bumps.global_vault_usdc,
         };
+        Ok(())
+    }
+
+    /// Repairs a previously-created `global_state` PDA whose discriminator/layout no longer matches
+    /// the current `GlobalState` struct (e.g. after a program upgrade / refactor).
+    ///
+    /// This keeps the PDA address stable and re-writes the account data with the current layout.
+    pub fn repair_global(ctx: Context<RepairGlobal>) -> Result<()> {
+        // Must already be program-owned to be repairable.
+        require_keys_eq!(
+            ctx.accounts.global_state.owner(),
+            crate::ID,
+            RouletteError::InvalidGlobalStateOwner
+        );
+
+        let desired_len: usize = 8 + GlobalState::SIZE;
+
+        // Ensure rent-exempt balance for desired length.
+        let rent = Rent::get()?;
+        let required_lamports = rent.minimum_balance(desired_len);
+        let current_lamports = ctx.accounts.global_state.to_account_info().lamports();
+        if current_lamports < required_lamports {
+            let diff = required_lamports.saturating_sub(current_lamports);
+            invoke(
+                &system_instruction::transfer(
+                    &ctx.accounts.payer.key(),
+                    &ctx.accounts.global_state.key(),
+                    diff,
+                ),
+                &[
+                    ctx.accounts.payer.to_account_info(),
+                    ctx.accounts.global_state.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Realloc if needed.
+        if ctx.accounts.global_state.to_account_info().data_len() != desired_len {
+            ctx.accounts
+                .global_state
+                .to_account_info()
+                .realloc(desired_len, false)?;
+        }
+
+        // Write new discriminator + serialized struct.
+        let mut data = ctx.accounts.global_state.to_account_info().try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&GlobalState::discriminator());
+
+        let gs = GlobalState {
+            usdc_mint: ctx.accounts.usdc_mint.key(),
+            vault_usdc: ctx.accounts.global_vault_usdc.key(),
+            total_locked_liability: 0,
+            total_active_bets: 0,
+            bumps: GlobalBumps {
+                global: ctx.bumps.global_state,
+                vault_usdc: ctx.bumps.global_vault_usdc,
+            },
+        };
+        gs.try_serialize(&mut &mut data[8..])?;
+
         Ok(())
     }
 
@@ -165,6 +227,12 @@ pub mod roulette_table {
     pub fn deposit_liquidity_usdc(ctx: Context<DepositLiquidityUsdc>, amount: u64) -> Result<()> {
         require!(amount > 0, RouletteError::InvalidAmount);
 
+        // Only the table operator with enough GOV tokens can manage liquidity
+        require!(
+            ctx.accounts.operator_gov_ata.amount >= OPERATOR_THRESHOLD,
+            RouletteError::NotEnoughGovToOperate
+        );
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.operator_usdc_ata.to_account_info(),
             to: ctx.accounts.global_vault_usdc.to_account_info(),
@@ -192,6 +260,12 @@ pub mod roulette_table {
     pub fn execute_withdraw(ctx: Context<WithdrawLiquidityUsdc>, amount: u64) -> Result<()> {
         let table = &mut ctx.accounts.table;
         require!(amount > 0, RouletteError::InvalidAmount);
+
+        // Only the table operator with enough GOV tokens can manage liquidity
+        require!(
+            ctx.accounts.operator_gov_ata.amount >= OPERATOR_THRESHOLD,
+            RouletteError::NotEnoughGovToOperate
+        );
 
         require!(table.active_bets == 0, RouletteError::ActiveBetsExist);
         require!(table.locked_liability == 0, RouletteError::LiabilityLocked);
@@ -444,6 +518,35 @@ pub struct InitGlobal<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RepairGlobal<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub usdc_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"global", usdc_mint.key().as_ref()],
+        bump
+    )]
+    pub global_state: UncheckedAccount<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        token::mint = usdc_mint,
+        token::authority = global_state,
+        seeds = [b"global_vault_usdc", global_state.key().as_ref()],
+        bump
+    )]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
+
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
 pub struct OnlyOperator<'info> {
     #[account(mut)]
     pub operator: Signer<'info>,
@@ -457,7 +560,17 @@ pub struct DepositLiquidityUsdc<'info> {
     pub operator: Signer<'info>,
     #[account(mut)]
     pub operator_usdc_ata: Account<'info, TokenAccount>,
-    #[account(mut)]
+
+    #[account(mut, has_one = operator)]
+    pub table: Account<'info, Table>,
+
+    #[account(
+        mut,
+        constraint = operator_gov_ata.mint == table.gov_mint
+    )]
+    pub operator_gov_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, address = table.global_state)]
     pub global_state: Account<'info, GlobalState>,
     #[account(mut, address = global_state.vault_usdc)]
     pub global_vault_usdc: Account<'info, TokenAccount>,
@@ -472,6 +585,13 @@ pub struct WithdrawLiquidityUsdc<'info> {
     pub operator_usdc_ata: Account<'info, TokenAccount>,
     #[account(mut, has_one = operator)]
     pub table: Account<'info, Table>,
+
+    #[account(
+        mut,
+        constraint = operator_gov_ata.mint == table.gov_mint
+    )]
+    pub operator_gov_ata: Account<'info, TokenAccount>,
+
     #[account(mut)]
     pub global_state: Account<'info, GlobalState>,
     #[account(mut, address = global_state.vault_usdc)]
@@ -964,6 +1084,9 @@ pub enum RouletteError {
     RandomnessDecodeFailed,
     #[msg("Randomness not fulfilled yet")]
     RandomnessNotFulfilled,
+
+    #[msg("Global state PDA is not owned by this program")]
+    InvalidGlobalStateOwner,
 
     #[msg("Active bets exist")]
     ActiveBetsExist,

@@ -4,7 +4,7 @@ import { Buffer } from 'buffer'
 
 // Make Buffer globally available for browser environment
 if (typeof window !== 'undefined') {
-  window.Buffer = Buffer
+  ;(window as any).Buffer = Buffer
 }
 
 function MyApp({ Component, pageProps }: AppProps) {

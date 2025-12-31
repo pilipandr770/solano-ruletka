@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useState } from 'react'
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Head from 'next/head'
 import { PublicKey, Connection } from '@solana/web3.js'
 import * as anchor from '@coral-xyz/anchor'
@@ -15,7 +15,8 @@ export default function Home() {
   const [publicKey, setPublicKey] = useState<PublicKey | null>(null)
   const [balance, setBalance] = useState<number | null>(null)
   const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL || 'https://api.devnet.solana.com'
-  const connection = new Connection(rpcUrl)
+  const connection = useMemo(() => new Connection(rpcUrl), [rpcUrl])
+  const balanceBackoffUntilRef = useRef<number>(0)
 
   function getProvider(): any | null {
     const w = window as any
@@ -53,11 +54,27 @@ export default function Home() {
 
   const fetchBalance = useCallback(async () => {
     if (!publicKey) return setBalance(null)
-    const lamports = await connection.getBalance(publicKey)
-    setBalance(lamports / 1e9)
+    const now = Date.now()
+    if (now < balanceBackoffUntilRef.current) return
+    try {
+      const lamports = await connection.getBalance(publicKey)
+      setBalance(lamports / 1e9)
+    } catch (e: any) {
+      const msg = String(e?.message || e)
+      // Handle devnet public RPC rate limiting (429)
+      if (msg.includes('429') || msg.includes('Too many requests')) {
+        balanceBackoffUntilRef.current = Date.now() + 15_000
+        return
+      }
+      console.warn('getBalance failed:', e)
+    }
   }, [publicKey, connection])
 
-  useEffect(() => { fetchBalance() }, [fetchBalance])
+  useEffect(() => {
+    fetchBalance()
+    const id = setInterval(() => fetchBalance(), 15_000)
+    return () => clearInterval(id)
+  }, [fetchBalance])
 
   // Attach Phantom connect/disconnect listeners for reactive updates
   useEffect(() => {
@@ -96,12 +113,84 @@ export default function Home() {
     return { program, provider }
   }
 
+  // UI gating for liquidity controls: only show to table operator with enough GOV
+  const OPERATOR_THRESHOLD = 51
+  const [isOperator, setIsOperator] = useState(false)
+  const [govBalanceUi, setGovBalanceUi] = useState(0)
+  const [govBalanceEnvUi, setGovBalanceEnvUi] = useState(0)
+
+  const envGovMint = process.env.NEXT_PUBLIC_GOV_MINT
+  const envTablePda = process.env.NEXT_PUBLIC_TABLE_PDA
+  const tableAddressIsPinned = Boolean(envTablePda)
+  const isFunctionalTokenOwner = govBalanceEnvUi >= OPERATOR_THRESHOLD
+
+  // Read GOV balance directly from env mint (works even before a table exists)
+  useEffect(() => {
+    ;(async () => {
+      try {
+        if (!publicKey || !envGovMint) {
+          setGovBalanceEnvUi(0)
+          return
+        }
+        const { provider } = await ensureProgram()
+        const govMintPk = new PublicKey(envGovMint)
+        const govAta = anchor.utils.token.associatedAddress({ mint: govMintPk, owner: publicKey })
+        const bal = await provider.connection.getTokenAccountBalance(govAta, 'confirmed')
+        setGovBalanceEnvUi(Number(bal.value.uiAmount || 0))
+      } catch {
+        setGovBalanceEnvUi(0)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [publicKey?.toBase58(), envGovMint])
+
+  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        if (!publicKey || !tableAddress) {
+          setIsOperator(false)
+          setGovBalanceUi(0)
+          return
+        }
+
+        const { program, provider } = await ensureProgram()
+
+        let tablePk: PublicKey
+        try {
+          tablePk = new PublicKey(tableAddress)
+        } catch {
+          setIsOperator(false)
+          setGovBalanceUi(0)
+          return
+        }
+
+        const tableAcc: any = await (program.account as any).table.fetch(tablePk)
+        const operatorPk = new PublicKey(tableAcc.operator)
+        setIsOperator(operatorPk.equals(publicKey))
+
+        const govMintPk = new PublicKey(tableAcc.govMint)
+        const govAta = anchor.utils.token.associatedAddress({ mint: govMintPk, owner: publicKey })
+        const bal = await provider.connection.getTokenAccountBalance(govAta, 'confirmed')
+        setGovBalanceUi(Number(bal.value.uiAmount || 0))
+      } catch {
+        // Table not created yet, ATA missing, etc.
+        setIsOperator(false)
+        setGovBalanceUi(0)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [publicKey?.toBase58(), tableAddress])
+
   const handleCreateTable = useCallback(async () => {
     try {
+      if (!isFunctionalTokenOwner) {
+        return alert('Only functional-token owners (GOV >= 51) can create tables')
+      }
       const { program, provider } = await ensureProgram()
       const seed = Math.floor(Math.random() * 1e6)
       const res = await anchorLib.createTable(program, provider, { seed, usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string, govMint: process.env.NEXT_PUBLIC_GOV_MINT as string, mode: 0, minBet: 1, maxBet: 1000000 })
-      console.log('createTable', res)
       // Calculate table PDA
       const [tablePda] = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from('table'), (publicKey as PublicKey).toBuffer(), new anchor.BN(seed).toArrayLike(Buffer, 'le', 8)], new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID as string))
       setTableAddress(tablePda.toBase58())
@@ -115,11 +204,202 @@ export default function Home() {
   const [selectedStreet, setSelectedStreet] = useState<number[] | null>(null)
   const [betType, setBetType] = useState<'straight'|'split'|'street'|'corner'|'red'|'black'|'dozen'|'column'>('straight')
   const [stake, setStake] = useState<number>(1)
-  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
   const [tableSeed, setTableSeed] = useState<number>(Math.floor(Math.random() * 1e6))
   const [betSlip, setBetSlip] = useState<Array<any>>([])
   const [lastBetPda, setLastBetPda] = useState<string>('')
   const [lastResult, setLastResult] = useState<{number: number, win: boolean, payout: number} | null>(null)
+
+  const [uiNotice, setUiNotice] = useState<{ kind: 'info' | 'success' | 'error'; text: string } | null>(null)
+  const [spinPhase, setSpinPhase] = useState<'idle' | 'waiting' | 'spinning' | 'revealed'>('idle')
+  const [spinningNumber, setSpinningNumber] = useState<number | null>(null)
+  const [wheelRotationDeg, setWheelRotationDeg] = useState(0)
+  const [spinReady, setSpinReady] = useState(false)
+  const [lastRandomPda, setLastRandomPda] = useState<string>('')
+
+  const rotationRef = useRef(0)
+  const rafRef = useRef<number | null>(null)
+  const animModeRef = useRef<'stopped' | 'free' | 'settling'>('stopped')
+  const lastPaintRef = useRef(0)
+
+  const EURO_WHEEL_ORDER = useMemo(
+    () => [0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26],
+    []
+  )
+
+  function rouletteColor(n: number): 'green' | 'red' | 'black' {
+    if (n === 0) return 'green'
+    const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36])
+    return redSet.has(n) ? 'red' : 'black'
+  }
+
+  const wheelGradient = useMemo(() => {
+    const seg = 360 / EURO_WHEEL_ORDER.length
+    const stops: string[] = []
+    for (let i = 0; i < EURO_WHEEL_ORDER.length; i++) {
+      const n = EURO_WHEEL_ORDER[i]
+      const start = i * seg
+      const end = (i + 1) * seg
+      const c = rouletteColor(n)
+      const col = c === 'green' ? '#155724' : c === 'red' ? '#721c24' : '#111'
+      stops.push(`${col} ${start}deg ${end}deg`)
+    }
+    return `conic-gradient(from 0deg, ${stops.join(', ')})`
+  }, [EURO_WHEEL_ORDER])
+
+  const wheelSegDeg = 360 / 37
+  const wheelBaseOffsetDeg = -wheelSegDeg / 2
+
+  function stopAnimation() {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    animModeRef.current = 'stopped'
+  }
+
+  function paintRotation(next: number, nowMs: number) {
+    rotationRef.current = next
+    // throttle paints a bit to avoid re-rendering too hard
+    if (nowMs - lastPaintRef.current > 16) {
+      lastPaintRef.current = nowMs
+      setWheelRotationDeg(next)
+    }
+  }
+
+  function easeOutCubic(t: number) {
+    return 1 - Math.pow(1 - t, 3)
+  }
+
+  function startFreeSpin() {
+    if (animModeRef.current === 'free') return
+    stopAnimation()
+    animModeRef.current = 'free'
+
+    let last = performance.now()
+    const speedDegPerSec = 720 // nice fast spin
+
+    const tick = (now: number) => {
+      if (animModeRef.current !== 'free') return
+      const dt = Math.max(0, now - last) / 1000
+      last = now
+      const next = rotationRef.current + speedDegPerSec * dt
+      paintRotation(next, now)
+      rafRef.current = requestAnimationFrame(tick)
+    }
+
+    rafRef.current = requestAnimationFrame(tick)
+  }
+
+  function settleToNumber(result: number) {
+    stopAnimation()
+    animModeRef.current = 'settling'
+
+    const seg = 360 / EURO_WHEEL_ORDER.length
+    const idx = EURO_WHEEL_ORDER.indexOf(result)
+    if (idx < 0) return
+
+    // Center of the winning segment in wheel local coords
+    const targetCenter = idx * seg + seg / 2
+    // We want targetCenter to end up at pointer (0deg), so rotation mod should be -targetCenter
+    const desiredMod = ((-targetCenter) % 360 + 360) % 360
+    const current = rotationRef.current
+    const currentMod = ((current % 360) + 360) % 360
+    const deltaMod = (desiredMod - currentMod + 360) % 360
+    const final = current + 360 * 6 + deltaMod
+
+    const start = performance.now()
+    const duration = 2600
+    const from = current
+    const to = final
+
+    const tick = (now: number) => {
+      if (animModeRef.current !== 'settling') return
+      const t = Math.min(1, (now - start) / duration)
+      const eased = easeOutCubic(t)
+      const next = from + (to - from) * eased
+      paintRotation(next, now)
+      if (t < 1) rafRef.current = requestAnimationFrame(tick)
+      else {
+        animModeRef.current = 'stopped'
+        rafRef.current = null
+      }
+    }
+
+    rafRef.current = requestAnimationFrame(tick)
+  }
+
+  useEffect(() => {
+    if (spinPhase === 'waiting' || spinPhase === 'spinning') {
+      startFreeSpin()
+      return
+    }
+    if (spinPhase === 'revealed' && spinningNumber !== null) {
+      settleToNumber(spinningNumber)
+      return
+    }
+    stopAnimation()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spinPhase, spinningNumber])
+
+  useEffect(() => () => stopAnimation(), [])
+
+  function clearBetEntryForNextRound() {
+    setSelectedNumber(null)
+    setSelectedPair(null)
+    setSelectedCorner(null)
+    setSelectedStreet(null)
+    setStake(1)
+    setBetType('straight')
+    setBetSlip([])
+    setSpinReady(false)
+    setLastRandomPda('')
+  }
+
+  // When we have a randomness account, poll readiness and guide the user.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        if (!lastRandomPda) return
+        if (!publicKey) return
+        if (!tableAddress) return
+        if (spinReady) return
+        if (spinPhase !== 'waiting') return
+
+        const { provider } = await ensureProgram()
+        const randomPk = new PublicKey(lastRandomPda)
+        const started = Date.now()
+
+        while (!cancelled && Date.now() - started < 30_000) {
+          const st = await anchorLib.getOraoRandomnessV2Fulfilled(provider, randomPk, 'confirmed')
+          if (st.fulfilled) {
+            if (cancelled) return
+            setSpinReady(true)
+            setSpinPhase('idle')
+            setUiNotice({
+              kind: 'success',
+              text: 'Случайность подтверждена (VRF). Нажми SPIN, чтобы открыть результат.',
+            })
+            return
+          }
+          await new Promise(r => setTimeout(r, 1200))
+        }
+
+        if (!cancelled) {
+          setUiNotice({
+            kind: 'info',
+            text: 'Ждём подтверждение VRF… Это занимает 5–15 секунд. Если долго — попробуй ещё раз через пару секунд.',
+          })
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.warn('VRF readiness poll failed:', e)
+        }
+      }
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastRandomPda, spinPhase, publicKey?.toBase58(), tableAddress, spinReady])
 
   function multiplierForBetType(t: string): number {
     switch (t) {
@@ -139,22 +419,26 @@ export default function Home() {
   }
 
   async function handlePlaceBetUI() {
-    if (!publicKey) return alert('Connect wallet first')
-    if (betType === 'straight' && selectedNumber === null) return alert('Select a number to bet on')
-    if (betType === 'split' && (!selectedPair || selectedPair[0] === selectedPair[1])) return alert('Select two adjacent numbers for split')
-    if (betType === 'split' && selectedCorner) return alert('For corner bets switch bet type to corner (handled via buttons)')
-    if (betType === 'street' && (!selectedStreet || selectedStreet.length !== 3)) return alert('Select a street (row of 3 numbers)')
-    if (betType === 'corner' && (!selectedCorner || selectedCorner.length !== 4)) return alert('Select a valid corner (4 numbers)')
-    if ((betType === 'dozen' || betType === 'column') && selectedNumber === null) return alert('Select a dozen/column first')
+    setUiNotice(null)
+    if (!publicKey) {
+      setUiNotice({ kind: 'error', text: 'Connect wallet first' })
+      return
+    }
+    if (betType === 'straight' && selectedNumber === null) return setUiNotice({ kind: 'error', text: 'Select a number to bet on' })
+    if (betType === 'split' && (!selectedPair || selectedPair[0] === selectedPair[1])) return setUiNotice({ kind: 'error', text: 'Select two adjacent numbers for split' })
+    if (betType === 'split' && selectedCorner) return setUiNotice({ kind: 'error', text: 'For corner bets switch bet type to corner' })
+    if (betType === 'street' && (!selectedStreet || selectedStreet.length !== 3)) return setUiNotice({ kind: 'error', text: 'Select a street (row of 3 numbers)' })
+    if (betType === 'corner' && (!selectedCorner || selectedCorner.length !== 4)) return setUiNotice({ kind: 'error', text: 'Select a valid corner (4 numbers)' })
+    if ((betType === 'dozen' || betType === 'column') && selectedNumber === null) return setUiNotice({ kind: 'error', text: 'Select a dozen/column first' })
     try {
       const { program, provider } = await ensureProgram()
       const player = publicKey as PublicKey
-      if (!tableAddress) return alert('Set table address in the Table section above')
+      if (!tableAddress) return setUiNotice({ kind: 'error', text: 'Set table address in the Table section above' })
       if (process.env.NEXT_PUBLIC_PROGRAM_ID && tableAddress === process.env.NEXT_PUBLIC_PROGRAM_ID) {
-        return alert('Table address is ProgramId. Create/select a real table PDA address.')
+        return setUiNotice({ kind: 'error', text: 'Table address is ProgramId. Create/select a real table PDA address.' })
       }
       let table: PublicKey
-      try { table = new PublicKey(tableAddress) } catch { return alert('Invalid table address') }
+      try { table = new PublicKey(tableAddress) } catch { return setUiNotice({ kind: 'error', text: 'Invalid table address' }) }
       let betKind: any = null
       if (betType === 'straight') betKind = { straight: { number: selectedNumber } }
       else if (betType === 'split') betKind = { split: { a: selectedPair[0], b: selectedPair[1] } }
@@ -172,12 +456,12 @@ export default function Home() {
       else if (betType === 'black') betKind = { black: {} }
       else if (betType === 'dozen') {
         const idx = selectedNumber
-        if (idx !== 1 && idx !== 2 && idx !== 3) return alert('Dozen idx must be 1,2,3')
+        if (idx !== 1 && idx !== 2 && idx !== 3) return setUiNotice({ kind: 'error', text: 'Dozen idx must be 1,2,3' })
         betKind = { dozen: { idx } }
       }
       else if (betType === 'column') {
         const idx = selectedNumber
-        if (idx !== 1 && idx !== 2 && idx !== 3) return alert('Column idx must be 1,2,3')
+        if (idx !== 1 && idx !== 2 && idx !== 3) return setUiNotice({ kind: 'error', text: 'Column idx must be 1,2,3' })
         betKind = { column: { idx } }
       }
       // UI is in USDC; program uses base units (6 decimals)
@@ -191,29 +475,37 @@ export default function Home() {
       const liq = await anchorLib.getGlobalLiquidity(provider, program.programId, usdcMintPk, 'confirmed')
       if (liq.available < required) {
         const missing = required - liq.available
-        return alert(
-          `Insufficient liquidity for this bet.\n` +
-          `Vault available: ${Number(liq.available) / 1e6} USDC\n` +
-          `Required (max payout): ${Number(required) / 1e6} USDC\n` +
-          `Deposit at least: ${Number(missing) / 1e6} USDC (or lower stake / pick lower-multiplier bet).`
-        )
+        return setUiNotice({
+          kind: 'error',
+          text:
+            `Insufficient liquidity. Available: ${Number(liq.available) / 1e6} USDC. ` +
+            `Required: ${Number(required) / 1e6} USDC. ` +
+            `Missing: ${Number(missing) / 1e6} USDC.`,
+        })
       }
 
+      setUiNotice({ kind: 'info', text: 'Bet submitted. Waiting for randomness…' })
       const res = await anchorLib.placeBet(program, provider, { table, betKind, stake: stakeBase })
-      console.log('placeBet result', res)
       setLastBetPda(res.betPda)
-      alert('placeBet transaction sent! Bet PDA: ' + res.betPda)
+      setLastRandomPda(res.randomPda)
+      setSpinReady(false)
+      setSpinPhase('waiting')
+      setUiNotice({
+        kind: 'info',
+        text: 'Ставка принята. Ждём подтверждение случайности (VRF)…',
+      })
     } catch (e: any) {
       console.error(e)
-      alert('placeBet failed: ' + (e?.message || e))
+      setUiNotice({ kind: 'error', text: 'placeBet failed: ' + (e?.message || e) })
     }
   }
 
   function addToSlip() {
-    if (betType === 'straight' && selectedNumber === null) return alert('Select a number')
-    if (betType === 'split' && (!selectedPair || selectedPair[0] === selectedPair[1])) return alert('Select a valid split')
-    if (betType === 'corner' && (!selectedCorner || selectedCorner.length !== 4)) return alert('Select a valid corner (4 numbers)')
-    if (betType === 'street' && (!selectedStreet || selectedStreet.length !== 3)) return alert('Select a valid street (3 numbers)')
+    setUiNotice(null)
+    if (betType === 'straight' && selectedNumber === null) return setUiNotice({ kind: 'error', text: 'Select a number' })
+    if (betType === 'split' && (!selectedPair || selectedPair[0] === selectedPair[1])) return setUiNotice({ kind: 'error', text: 'Select a valid split' })
+    if (betType === 'corner' && (!selectedCorner || selectedCorner.length !== 4)) return setUiNotice({ kind: 'error', text: 'Select a valid corner (4 numbers)' })
+    if (betType === 'street' && (!selectedStreet || selectedStreet.length !== 3)) return setUiNotice({ kind: 'error', text: 'Select a valid street (3 numbers)' })
     let value: any = null
     if (betType === 'split') value = selectedPair
     else if (betType === 'corner') value = selectedCorner
@@ -225,14 +517,16 @@ export default function Home() {
   }
 
   async function submitSlip() {
-    if (!publicKey) return alert('Connect wallet first')
-    if (!betSlip.length) return alert('Slip is empty')
+    setUiNotice(null)
+    if (!publicKey) return setUiNotice({ kind: 'error', text: 'Connect wallet first' })
+    if (!betSlip.length) return setUiNotice({ kind: 'error', text: 'Slip is empty' })
     try {
       const { program, provider } = await ensureProgram()
       const player = publicKey as PublicKey
-      if (!tableAddress) return alert('Set table address in the input above')
+      if (!tableAddress) return setUiNotice({ kind: 'error', text: 'Set table address in the input above' })
       let table: PublicKey
-      try { table = new PublicKey(tableAddress) } catch (err) { console.error('Invalid tableAddress', tableAddress, err); return alert('Invalid table address') }
+      try { table = new PublicKey(tableAddress) } catch (err) { console.error('Invalid tableAddress', tableAddress, err); return setUiNotice({ kind: 'error', text: 'Invalid table address' }) }
+      setUiNotice({ kind: 'info', text: 'Submitting slip…' })
       for (const b of betSlip) {
         let betKind: any = null
         if (b.type === 'straight') betKind = { straight: { number: b.value } }
@@ -260,7 +554,7 @@ export default function Home() {
           throw err
         }
       }
-      alert('Submitted slip (transactions sent).')
+      setUiNotice({ kind: 'success', text: 'Slip submitted (transactions sent).' })
       setBetSlip([])
     } catch (e:any) { console.error(e); alert(e?.message||e) }
   }
@@ -277,6 +571,16 @@ export default function Home() {
   return (
     <div>
       <Head><title>Provably-Fair Roulette</title></Head>
+      <style jsx>{`
+        @keyframes popIn {
+          from { transform: scale(0.9); opacity: 0; }
+          to { transform: scale(1); opacity: 1; }
+        }
+        @keyframes ballOrbit {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
       <main style={{maxWidth:900,margin:'40px auto',padding:'0 20px',fontFamily:'Inter, Arial'}}>
         <header style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
           <h1 style={{margin:0}}>Provably-Fair Roulette  Table</h1>
@@ -296,142 +600,300 @@ export default function Home() {
 
         <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
           <h2>Table</h2>
-          <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
-            <label style={{display:'flex',gap:8,alignItems:'center'}}>
-              Table number (seed):
-              <input
-                type="number"
-                value={tableSeed}
-                onChange={(e)=>setTableSeed(Number(e.target.value||0))}
-                style={{width:160}}
-              />
-            </label>
-            <button onClick={async ()=>{
-              try {
-                if (!publicKey) return alert('Connect wallet first')
-                const { program, provider } = await ensureProgram()
-                const seed = Number.isFinite(tableSeed) ? Math.floor(tableSeed) : Math.floor(Math.random()*1e6)
-                const res = await anchorLib.createTable(program, provider, {
-                  seed,
-                  usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string,
-                  govMint: process.env.NEXT_PUBLIC_GOV_MINT as string,
-                  mode: 0,
-                  // base units (6 decimals)
-                  minBet: 10_000, // 0.01 USDC
-                  maxBet: 1_000_000_000, // 1000 USDC
-                })
-                console.log('createTable tx', res)
-                if (!process.env.NEXT_PUBLIC_PROGRAM_ID) throw new Error('NEXT_PUBLIC_PROGRAM_ID is missing')
-                const tablePda = res.tablePda
-                setTableAddress(tablePda)
-                
-                // Wait for account to be created on-chain
-                console.log('Waiting for table account to be created...')
-                let attempts = 0
-                while (attempts < 10) {
-                  await new Promise(resolve => setTimeout(resolve, 1000))
-                  const info = await connection.getAccountInfo(new PublicKey(tablePda))
-                  if (info) {
-                    alert('Table created successfully! Address: ' + tablePda)
-                    return
-                  }
-                  attempts++
-                }
-                alert('Table tx sent but account not yet visible. Address: ' + tablePda)
-              } catch (e:any) {
-                console.error(e)
-                alert('createTable failed: ' + (e?.message || e))
-              }
-            }}>Create Table</button>
-          </div>
-
-          <div style={{marginTop:12}}>
-            <label style={{display:'block',marginBottom:6}}>Table address (PDA)</label>
-            <input
-              value={tableAddress}
-              onChange={(e)=>setTableAddress(e.target.value.trim())}
-              placeholder="Paste table PDA here, or click Create Table"
-              style={{width:'100%'}}
-            />
-            <div style={{marginTop:8, color:'#666', fontSize:13}}>
-              Multiple tables are supported by choosing a different seed; each (creator, seed) maps to a unique PDA address.
-            </div>
-          </div>
-
-          <div style={{marginTop:16,padding:12,background:'#fff3cd',borderRadius:6}}>
-            <h3 style={{margin:'0 0 8px 0',fontSize:15}}>Deposit Liquidity (Required before bets)</h3>
-            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-              <input
-                type="number"
-                placeholder="Amount (USDC)"
-                id="liquidityAmount"
-                style={{width:150}}
-                defaultValue={10}
-              />
+          {isFunctionalTokenOwner ? (
+            <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
+              <label style={{display:'flex',gap:8,alignItems:'center'}}>
+                Table number (seed):
+                <input
+                  type="number"
+                  value={tableSeed}
+                  onChange={(e)=>setTableSeed(Number(e.target.value||0))}
+                  style={{width:160}}
+                />
+              </label>
               <button onClick={async ()=>{
                 try {
                   if (!publicKey) return alert('Connect wallet first')
-                  if (!tableAddress) return alert('Set table address first')
                   const { program, provider } = await ensureProgram()
-                  const amountUi = Number((document.getElementById('liquidityAmount') as HTMLInputElement)?.value || 0)
-                  if (!amountUi || amountUi <= 0) return alert('Enter valid amount')
-                  const amount = Math.round(amountUi * 1_000_000)
-                  const table = new PublicKey(tableAddress)
-                  await anchorLib.depositLiquidity(program, provider, { table, amount })
-                  alert('Liquidity deposited successfully!')
-                } catch (e: any) {
+                  const seed = Number.isFinite(tableSeed) ? Math.floor(tableSeed) : Math.floor(Math.random()*1e6)
+                  const res = await anchorLib.createTable(program, provider, {
+                    seed,
+                    usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string,
+                    govMint: process.env.NEXT_PUBLIC_GOV_MINT as string,
+                    mode: 0,
+                    // base units (6 decimals)
+                    minBet: 10_000, // 0.01 USDC
+                    maxBet: 1_000_000_000, // 1000 USDC
+                  })
+                  const tablePda = res.tablePda
+                  setTableAddress(tablePda)
+
+                  // Wait for account to be created on-chain
+                  let attempts = 0
+                  while (attempts < 10) {
+                    await new Promise(resolve => setTimeout(resolve, 1000))
+                    const info = await connection.getAccountInfo(new PublicKey(tablePda))
+                    if (info) {
+                      alert('Table created successfully! Address: ' + tablePda)
+                      return
+                    }
+                    attempts++
+                  }
+                  alert('Table tx sent but account not yet visible. Address: ' + tablePda)
+                } catch (e:any) {
                   console.error(e)
-                  alert('depositLiquidity failed: ' + (e?.message || e))
+                  alert('createTable failed: ' + (e?.message || e))
                 }
-              }}>Deposit Liquidity</button>
-              <span style={{fontSize:13,color:'#856404'}}>Operators must fund the vault before players can bet</span>
+              }}>Create Table</button>
             </div>
+          ) : (
+            <div style={{fontSize:13,color:'#666'}}>
+              Table creation is available only to functional-token owners.
+            </div>
+          )}
+
+          <div style={{marginTop:12}}>
+            <div style={{fontSize:13,color:'#666'}}>
+              {tableAddress
+                ? `Table: configured (${tableAddress.slice(0, 4)}…${tableAddress.slice(-4)})`
+                : 'Table: not configured (operator must set NEXT_PUBLIC_TABLE_PDA or create a table)'}
+            </div>
+
+            {/* For security + simplicity: show table address input only to owners/operators when not pinned */}
+            {!tableAddressIsPinned && isFunctionalTokenOwner ? (
+              <div style={{marginTop:10}}>
+                <label style={{display:'block',marginBottom:6}}>Table address (PDA) (owner only)</label>
+                <input
+                  value={tableAddress}
+                  onChange={(e)=>setTableAddress(e.target.value.trim())}
+                  placeholder={'Paste table PDA here'}
+                  style={{width:'100%'}}
+                />
+              </div>
+            ) : null}
           </div>
+
+          {(isOperator && govBalanceUi >= OPERATOR_THRESHOLD) ? (
+            <div style={{marginTop:16,padding:12,background:'#fff3cd',borderRadius:6}}>
+              <h3 style={{margin:'0 0 8px 0',fontSize:15}}>Deposit Liquidity (Required before bets)</h3>
+              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                <input
+                  type="number"
+                  placeholder="Amount (USDC)"
+                  id="liquidityAmount"
+                  style={{width:150}}
+                  defaultValue={10}
+                />
+                <button onClick={async ()=>{
+                  try {
+                    if (!publicKey) return alert('Connect wallet first')
+                    if (!tableAddress) return alert('Set table address first')
+                    const { program, provider } = await ensureProgram()
+                    const amountUi = Number((document.getElementById('liquidityAmount') as HTMLInputElement)?.value || 0)
+                    if (!amountUi || amountUi <= 0) return alert('Enter valid amount')
+                    const amount = Math.round(amountUi * 1_000_000)
+                    const table = new PublicKey(tableAddress)
+                    await anchorLib.depositLiquidity(program, provider, { table, amount })
+                    alert('Liquidity deposited successfully!')
+                  } catch (e: any) {
+                    console.error(e)
+                    alert('depositLiquidity failed: ' + (e?.message || e))
+                  }
+                }}>Deposit Liquidity</button>
+                <span style={{fontSize:13,color:'#856404'}}>Operators must fund the vault before players can bet</span>
+              </div>
+
+              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginTop:10}}>
+                <input
+                  type="number"
+                  placeholder="Withdraw (USDC)"
+                  id="withdrawAmount"
+                  style={{width:150}}
+                  defaultValue={1}
+                />
+                <button onClick={async ()=>{
+                  try {
+                    if (!publicKey) return alert('Connect wallet first')
+                    if (!tableAddress) return alert('Set table address first')
+                    const { program, provider } = await ensureProgram()
+                    const amountUi = Number((document.getElementById('withdrawAmount') as HTMLInputElement)?.value || 0)
+                    if (!amountUi || amountUi <= 0) return alert('Enter valid amount')
+                    const amount = Math.round(amountUi * 1_000_000)
+                    const table = new PublicKey(tableAddress)
+                    await anchorLib.executeWithdraw(program, provider, { table, amount })
+                    alert('Liquidity withdrawn successfully!')
+                  } catch (e: any) {
+                    console.error(e)
+                    alert('withdraw failed: ' + (e?.message || e))
+                  }
+                }}>Withdraw Liquidity</button>
+                <span style={{fontSize:13,color:'#856404'}}>Withdraw rules depend on table mode (PUBLIC has delay)</span>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
           <h2>Resolve Bet (Spin Roulette)</h2>
-          {lastResult && (
-            <div style={{
-              marginBottom: 12, 
-              padding: 10, 
-              borderRadius: 6, 
-              background: lastResult.win ? '#d4edda' : '#f8d7da',
-              color: lastResult.win ? '#155724' : '#721c24',
-              border: `1px solid ${lastResult.win ? '#c3e6cb' : '#f5c6cb'}`,
-              textAlign: 'center',
-              fontWeight: 'bold',
-              fontSize: 18
-            }}>
-              SPIN RESULT: {lastResult.number} — {lastResult.win ? `WON ${lastResult.payout} USDC` : 'LOST'}
+          <div style={{display:'flex',gap:18,alignItems:'center',flexWrap:'wrap',marginBottom:12}}>
+            <div
+              style={{
+                width: 140,
+                height: 140,
+                borderRadius: '50%',
+                border: '10px solid #f7f7f7',
+                position: 'relative',
+                background: wheelGradient,
+                boxShadow: 'inset 0 0 0 2px rgba(255,255,255,0.65)',
+                transform: `rotate(${wheelRotationDeg + wheelBaseOffsetDeg}deg)`,
+              }}
+            >
+              <div
+                style={{
+                  position: 'absolute',
+                  top: -12,
+                  left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: 0,
+                  height: 0,
+                  borderLeft: '10px solid transparent',
+                  borderRight: '10px solid transparent',
+                  borderBottom: '16px solid #333',
+                }}
+              />
+
+              {(spinPhase === 'waiting' || spinPhase === 'spinning') && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    inset: 8,
+                    borderRadius: '50%',
+                    animation: 'ballOrbit 0.55s linear infinite',
+                  }}
+                >
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: -2,
+                      left: '50%',
+                      transform: 'translateX(-50%)',
+                      width: 10,
+                      height: 10,
+                      borderRadius: '50%',
+                      background: '#fff',
+                      boxShadow: '0 0 0 2px rgba(0,0,0,0.15)',
+                    }}
+                  />
+                </div>
+              )}
+
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 18,
+                  borderRadius: '50%',
+                  background: '#fff',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontWeight: 800,
+                  fontSize: 36,
+                  animation: spinPhase === 'revealed' ? 'popIn 220ms ease-out' : undefined,
+                  color:
+                    spinningNumber === null
+                      ? '#333'
+                      : rouletteColor(spinningNumber) === 'red'
+                        ? '#721c24'
+                        : rouletteColor(spinningNumber) === 'green'
+                          ? '#155724'
+                          : '#111',
+                }}
+              >
+                {spinningNumber === null ? '—' : spinningNumber}
+              </div>
             </div>
-          )}
+
+            <div style={{minWidth: 320}}>
+              <div style={{fontSize:14,color:'#555',marginBottom:6}}>
+                {spinPhase === 'waiting' && 'Waiting for ORAO VRF…'}
+                {spinPhase === 'spinning' && 'Spinning…'}
+                {spinPhase === 'revealed' && 'Result'}
+                {spinPhase === 'idle' && 'Ready'}
+              </div>
+              {uiNotice && (
+                <div
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    background:
+                      uiNotice.kind === 'success'
+                        ? '#d4edda'
+                        : uiNotice.kind === 'error'
+                          ? '#f8d7da'
+                          : '#d1ecf1',
+                    color:
+                      uiNotice.kind === 'success'
+                        ? '#155724'
+                        : uiNotice.kind === 'error'
+                          ? '#721c24'
+                          : '#0c5460',
+                    border:
+                      uiNotice.kind === 'success'
+                        ? '1px solid #c3e6cb'
+                        : uiNotice.kind === 'error'
+                          ? '1px solid #f5c6cb'
+                          : '1px solid #bee5eb',
+                  }}
+                >
+                  {uiNotice.text}
+                </div>
+              )}
+              {lastResult && (
+                <div style={{marginTop:10,fontSize:15,fontWeight:700}}>
+                  {lastResult.win
+                    ? `WIN: +${lastResult.payout} USDC`
+                    : 'LOSS'}
+                </div>
+              )}
+            </div>
+          </div>
           <div style={{padding:12,background:'#d1ecf1',borderRadius:6}}>
             <p style={{margin:'0 0 12px 0',fontSize:14}}>
-              After placing a bet, wait ~5-10 seconds for ORAO VRF to fulfill randomness, then resolve to get the winning number and payout.
+              Сначала делаем ставку. Затем ORAO VRF подтверждает случайность (это защищает от подкрутки). Когда будет готово — нажми SPIN.
             </p>
             <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-              <input
-                type="text"
-                placeholder="Bet PDA (from placeBet result)"
-                id="betPdaInput"
-                value={lastBetPda}
-                onChange={(e)=>setLastBetPda(e.target.value.trim())}
-                style={{width:400}}
-              />
-              <button onClick={async ()=>{
+              <button disabled={!lastBetPda || !tableAddress || spinPhase === 'waiting' || spinPhase === 'spinning'} onClick={async ()=>{
                 try {
-                  if (!publicKey) return alert('Connect wallet first')
-                  if (!tableAddress) return alert('Set table address first')
+                  setUiNotice(null)
+                  if (!publicKey) {
+                    setUiNotice({ kind: 'error', text: 'Connect wallet first' })
+                    return
+                  }
+                  if (!tableAddress) {
+                    setUiNotice({ kind: 'error', text: 'Set table address first' })
+                    return
+                  }
                   const betPdaStr = lastBetPda?.trim()
-                  if (!betPdaStr) return alert('Enter bet PDA (automatically filled after placeBet)')
+                  if (!betPdaStr) return setUiNotice({ kind: 'error', text: 'Сначала сделай ставку' })
                   const { program, provider } = await ensureProgram()
                   const table = new PublicKey(tableAddress)
                   const bet = new PublicKey(betPdaStr)
+
+                  // If we just placed a bet, we likely already polled readiness. Keep the UX consistent:
+                  // show waiting only when not ready.
+                  if (!spinReady) {
+                    setSpinPhase('waiting')
+                    setSpinningNumber(null)
+                    setUiNotice({ kind: 'info', text: 'Ждём подтверждение VRF…' })
+                  }
                   
                   // Check if randomness is fulfilled (optional)
                   const betInfo = await provider.connection.getAccountInfo(bet)
-                  if (!betInfo) return alert('Bet account not found')
+                  if (!betInfo) {
+                    setSpinPhase('idle')
+                    setUiNotice({ kind: 'error', text: 'Bet account not found' })
+                    return
+                  }
 
                   // If it's already settled, don't send another tx; just show the result.
                   try {
@@ -439,11 +901,16 @@ export default function Home() {
                     if (!existing.isSettled) existing = await anchorLib.getBet(provider, bet, 'finalized')
                     if (existing.isSettled && existing.resultNumber !== null) {
                       const win = existing.payout > 0n
-                      alert(
-                        `Already resolved.\nResult: ${existing.resultNumber}\n` +
-                        (win ? `YOU WON! Payout: ${Number(existing.payout) / 1e6} USDC` : 'You lost.')
-                      )
+                      setSpinPhase('revealed')
+                      setSpinningNumber(existing.resultNumber)
                       setLastResult({ number: existing.resultNumber, win, payout: Number(existing.payout) / 1e6 })
+                      clearBetEntryForNextRound()
+                      setUiNotice({
+                        kind: win ? 'success' : 'info',
+                        text: win
+                          ? `Already resolved. Result ${existing.resultNumber}. Won ${Number(existing.payout) / 1e6} USDC.`
+                          : `Already resolved. Result ${existing.resultNumber}. Lost.`,
+                      })
                       return
                     }
                   } catch {
@@ -462,16 +929,20 @@ export default function Home() {
                     }
                     const st2 = await anchorLib.getOraoRandomnessV2Fulfilled(provider, randomPda, 'confirmed')
                     if (!st2.fulfilled) {
-                      return alert('Randomness not fulfilled yet. Wait a bit more (5-15s) and try Resolve again.')
+                      setSpinPhase('waiting')
+                      setUiNotice({ kind: 'info', text: 'Randomness not fulfilled yet. Wait 5–15s and try again.' })
+                      return
                     }
                   } catch (pollErr) {
                     console.warn('Randomness poll warning:', pollErr)
                     // If polling fails for any reason, we still try resolve; program will enforce fulfillment.
                   }
+
+                  setSpinPhase('spinning')
+                  setUiNotice({ kind: 'info', text: 'Spinning…' })
                   
                   // Pass player explicitly to avoid decoding issues
                   const txSig = await anchorLib.resolveBet(program, provider, { table, bet, player: publicKey })
-                  console.log('resolveBet tx:', txSig)
 
                   // Confirm + read result (avoid stale reads)
                   try {
@@ -487,49 +958,57 @@ export default function Home() {
                       // Some RPCs can lag on account state at lower commitments
                       betData = await anchorLib.getBet(provider, bet, 'finalized')
                     }
-                    console.log('Bet state after resolve:', betData.isSettled ? 'Settled' : 'Pending', betData.resultNumber)
-                    
                     if (betData.isSettled && betData.resultNumber !== null) {
                       const win = betData.payout > 0n
-                      const msg = `Result: ${betData.resultNumber}\n` +
-                                  (win ? `YOU WON! Payout: ${Number(betData.payout)/1e6} USDC` : 'You lost.')
-                      alert(msg)
-                      // Update UI with result
+                      setSpinPhase('revealed')
+                      setSpinningNumber(betData.resultNumber)
                       setLastResult({ number: betData.resultNumber, win, payout: Number(betData.payout)/1e6 })
+                      clearBetEntryForNextRound()
+                      setUiNotice({
+                        kind: win ? 'success' : 'info',
+                        text: win
+                          ? `Result ${betData.resultNumber}. Won ${Number(betData.payout)/1e6} USDC.`
+                          : `Result ${betData.resultNumber}. Lost.`,
+                      })
                     } else {
                       // If still pending, check transaction status
-                      console.log('Bet still pending. Checking transaction...')
                       try {
                         const tx = await provider.connection.getTransaction(txSig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
-                        console.log('Transaction details:', tx)
                         
                         if (tx && tx.meta && tx.meta.err) {
-                          alert('Resolve transaction FAILED! See console for logs.')
+                          setSpinPhase('idle')
+                          setUiNotice({ kind: 'error', text: 'Resolve transaction failed. Check console for logs.' })
                           console.error('Transaction error:', tx.meta.err)
-                          console.log('Transaction logs:', tx.meta.logMessages)
                         } else if (tx) {
-                          alert('Transaction success but account not updated? This is rare. Check explorer.')
+                          setSpinPhase('idle')
+                          setUiNotice({ kind: 'info', text: 'Tx succeeded but account not updated yet (RPC lag). Try again in a few seconds.' })
                         } else {
-                          alert('Transaction not found yet. Solana might be congested.')
+                          setSpinPhase('idle')
+                          setUiNotice({ kind: 'info', text: 'Transaction not found yet (congestion). Wait a bit and retry.' })
                         }
                       } catch (txErr) {
                         console.error('Error fetching transaction:', txErr)
-                        alert('Could not fetch transaction details.')
+                        setSpinPhase('idle')
+                        setUiNotice({ kind: 'error', text: 'Could not fetch transaction details.' })
                       }
                     }
                   } catch (err) {
                     console.error('Error fetching bet result:', err)
-                    alert('Bet resolved, but failed to fetch result.')
+                    setSpinPhase('idle')
+                    setUiNotice({ kind: 'error', text: 'Resolved, but failed to fetch result (RPC lag). Try again.' })
                   }
 
                 } catch (e: any) {
                   console.error(e)
-                  alert('resolveBet failed: ' + (e?.message || e))
+                  setSpinPhase('idle')
+                  setUiNotice({ kind: 'error', text: 'resolveBet failed: ' + (e?.message || e) })
                 }
-              }}>Resolve Bet / Spin</button>
+              }}>{spinReady ? 'SPIN' : (lastBetPda ? 'WAIT…' : 'SPIN')}</button>
             </div>
             <div style={{marginTop:8,fontSize:13,color:'#0c5460'}}>
-              Tip: Copy the "betPda" from the placeBet console log and paste here.
+              {(!lastBetPda) && 'Шаг 1: сделай ставку. После этого появится ожидание VRF.'}
+              {(lastBetPda && !spinReady) && 'Шаг 2: идёт проверяемая генерация случайности (VRF). Это нужно для честной рулетки.'}
+              {(lastBetPda && spinReady) && 'Шаг 3: нажми SPIN, чтобы открыть результат и выплату.'}
             </div>
           </div>
         </section>
