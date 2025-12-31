@@ -1,7 +1,8 @@
 import * as anchor from '@coral-xyz/anchor'
-import { PublicKey, SystemProgram, Connection } from '@solana/web3.js'
+import { PublicKey, SystemProgram, Connection, Transaction } from '@solana/web3.js'
 import {
   TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountInstruction,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token'
 import { sha256 } from '@noble/hashes/sha256'
@@ -635,6 +636,23 @@ export async function placeBet(
   const usdcMintPk = new PublicKey(tableAcc.usdcMint)
   const playerUsdcAta =
     args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, player)
+
+  // Some wallets/accounts (especially on a fresh device) won't have the ATA created yet.
+  // The program expects `player_usdc_ata` to exist, so we create it client-side if missing.
+  const ataInfo = await provider.connection.getAccountInfo(playerUsdcAta, 'confirmed')
+  if (!ataInfo) {
+    const ix = createAssociatedTokenAccountInstruction(
+      player, // payer
+      playerUsdcAta, // ata address
+      player, // owner
+      usdcMintPk // mint
+    )
+    const tx = new Transaction().add(ix)
+    tx.feePayer = player
+    const { blockhash } = await provider.connection.getLatestBlockhash('confirmed')
+    tx.recentBlockhash = blockhash
+    await provider.sendAndConfirm(tx, [], { commitment: 'confirmed' })
+  }
 
   const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
