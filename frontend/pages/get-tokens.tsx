@@ -20,6 +20,16 @@ export default function GetTokens() {
             This page explains how to get SOL and demo tokens for {cluster}.
           </p>
 
+          <h2>0) Install a wallet</h2>
+          <p>
+            You need a Solana wallet browser extension. Recommended:
+          </p>
+          <ul>
+            <li>
+              <a href="https://solflare.com/" target="_blank" rel="noreferrer">Install Solflare</a>
+            </li>
+          </ul>
+
           <h2>1) Get SOL (needed for fees)</h2>
           <p>
             Use the official Solana faucet for devnet/testnet:

@@ -603,7 +603,12 @@ export default function Home() {
                   <button className="btn-secondary" onClick={disconnect}>Disconnect</button>
                 </>
               ) : (
-                <button onClick={connect}>Connect Phantom</button>
+                <div className="row">
+                  <button onClick={connect}>Connect wallet</button>
+                  <a className="muted" href="https://solflare.com/" target="_blank" rel="noreferrer" style={{fontSize:13, textDecoration:'none'}}>
+                    Install Solflare
+                  </a>
+                </div>
               )}
             </div>
           </div>
