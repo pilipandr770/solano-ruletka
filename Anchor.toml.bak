@@ -1,0 +1,20 @@
+[toolchain]
+anchor_version = "0.31.0"
+solana_version = "2.1.0"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+roulette_table = "8vKVN8CR9zcw7Jh74P4vKuYVbX6q1FivyzWN8sM9JGiN"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "target/deploy/deployer-keypair.json"
+
+[scripts]
+test = "npx mocha -t 1000000 tests/**/*.ts"

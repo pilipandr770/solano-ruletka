@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![allow(warnings)]
 // https://github.com/Marwes/combine/issues/172
 #![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]

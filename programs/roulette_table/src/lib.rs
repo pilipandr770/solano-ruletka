@@ -1,21 +1,20 @@
+#![allow(deprecated)]
+#![allow(unexpected_cfgs)]
+
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-// Temporarily commented to fix discriminator bug - will re-enable later
-// use orao_solana_vrf::{
-//     cpi as orao_cpi,
-//     state::{NetworkState, RandomnessAccountData},
-//     CONFIG_ACCOUNT_SEED,
-//     RANDOMNESS_ACCOUNT_SEED,
-// };
-
-// Temporary constants for build
-const CONFIG_ACCOUNT_SEED: &[u8] = b"orao-vrf-config";
-const RANDOMNESS_ACCOUNT_SEED: &[u8] = b"orao-vrf-randomness-request";
+// ORAO VRF CPI
+use orao_solana_vrf::{
+    cpi as orao_cpi,
+    state::RandomnessAccountData,
+    CONFIG_ACCOUNT_SEED,
+    RANDOMNESS_ACCOUNT_SEED,
+};
 
 use std::str::FromStr;
 
-declare_id!("AV5r5GYG7adU9q1ojmyawExGtx2BAAqhtWa2AAXLNVa8");
+declare_id!("ErfuhJxxpHNKviT5LCnupGhSUbXpjfRThxikEgb94aDt");
 
 pub const GOV_TOTAL_SUPPLY: u64 = 100;
 pub const OPERATOR_THRESHOLD: u64 = 51;
@@ -46,7 +45,7 @@ pub mod roulette_table {
 
         table.usdc_mint = ctx.accounts.usdc_mint.key();
         table.gov_mint = ctx.accounts.gov_mint.key();
-        table.vault_usdc = ctx.accounts.vault_usdc.key();
+        table.global_state = ctx.accounts.global_state.key();
         table.control_vault_gov = ctx.accounts.control_vault_gov.key();
 
         table.min_bet = min_bet;
@@ -61,10 +60,22 @@ pub mod roulette_table {
 
         table.bumps = TableBumps {
             table: ctx.bumps.table,
-            vault_usdc: ctx.bumps.vault_usdc,
             control_vault_gov: ctx.bumps.control_vault_gov,
         };
 
+        Ok(())
+    }
+
+    pub fn init_global(ctx: Context<InitGlobal>) -> Result<()> {
+        let gs = &mut ctx.accounts.global_state;
+        gs.usdc_mint = ctx.accounts.usdc_mint.key();
+        gs.vault_usdc = ctx.accounts.global_vault_usdc.key();
+        gs.total_locked_liability = 0;
+        gs.total_active_bets = 0;
+        gs.bumps = GlobalBumps {
+            global: ctx.bumps.global_state,
+            vault_usdc: ctx.bumps.global_vault_usdc,
+        };
         Ok(())
     }
 
@@ -156,7 +167,7 @@ pub mod roulette_table {
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.operator_usdc_ata.to_account_info(),
-            to: ctx.accounts.vault_usdc.to_account_info(),
+            to: ctx.accounts.global_vault_usdc.to_account_info(),
             authority: ctx.accounts.operator.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
@@ -196,16 +207,15 @@ pub mod roulette_table {
             table.withdraw_request_ts = 0;
         }
 
-        let seed_bytes = table.seed.to_le_bytes();
-        let bump = [table.bumps.table];
-        let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
+        // Withdraw from shared global vault (signed by GlobalState PDA)
+        let gs = &mut ctx.accounts.global_state;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"global", gs.usdc_mint.as_ref(), &[gs.bumps.global]]];
         let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_usdc.to_account_info(),
+            from: ctx.accounts.global_vault_usdc.to_account_info(),
             to: ctx.accounts.operator_usdc_ata.to_account_info(),
-            authority: table.to_account_info(),
+            authority: gs.to_account_info(),
         };
-        let cpi_ctx =
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
+        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds);
         token::transfer(cpi_ctx, amount)?;
 
         Ok(())
@@ -226,13 +236,15 @@ pub mod roulette_table {
             .checked_mul((multiplier + 1) as u64)
             .ok_or(RouletteError::MathOverflow)?;
 
-        let vault_balance = ctx.accounts.vault_usdc.amount;
-        let available = vault_balance.saturating_sub(table.locked_liability);
+        let gs = &mut ctx.accounts.global_state;
+
+        let vault_balance = ctx.accounts.global_vault_usdc.amount;
+        let available = vault_balance.saturating_sub(gs.total_locked_liability);
         require!(available >= max_total_payout, RouletteError::InsufficientLiquidity);
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.player_usdc_ata.to_account_info(),
-            to: ctx.accounts.vault_usdc.to_account_info(),
+            to: ctx.accounts.global_vault_usdc.to_account_info(),
             authority: ctx.accounts.player.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
@@ -241,6 +253,9 @@ pub mod roulette_table {
         table.locked_liability = table.locked_liability.saturating_add(max_total_payout);
         table.active_bets = table.active_bets.saturating_add(1);
         table.bet_seq = table.bet_seq.saturating_add(1);
+
+        gs.total_locked_liability = gs.total_locked_liability.saturating_add(max_total_payout);
+        gs.total_active_bets = gs.total_active_bets.saturating_add(1);
 
         let now = Clock::get()?.unix_timestamp;
         let bet_acc = &mut ctx.accounts.bet;
@@ -255,18 +270,17 @@ pub mod roulette_table {
         bet_acc.force = force;
         bet_acc.randomness_account = ctx.accounts.random.key();
 
-        // CPI ORAO: request_v2 - TEMPORARILY DISABLED TO FIX DISCRIMINATOR BUG
-        // TODO: Re-enable after fixing dependency issues
-        // let cpi_program = ctx.accounts.vrf.to_account_info();
-        // let cpi_accounts = orao_cpi::accounts::RequestV2 {
-        //     payer: ctx.accounts.player.to_account_info(),
-        //     network_state: ctx.accounts.config.to_account_info(),
-        //     treasury: ctx.accounts.treasury.to_account_info(),
-        //     request: ctx.accounts.random.to_account_info(),
-        //     system_program: ctx.accounts.system_program.to_account_info(),
-        // };
-        // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        // orao_cpi::request_v2(cpi_ctx, force)?;
+        // ORAO VRF CPI: request randomness
+        let cpi_program = ctx.accounts.vrf.to_account_info();
+        let cpi_accounts = orao_cpi::accounts::RequestV2 {
+            payer: ctx.accounts.player.to_account_info(),
+            network_state: ctx.accounts.config.clone(),
+            treasury: ctx.accounts.treasury.clone(),
+            request: ctx.accounts.random.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        orao_cpi::request_v2(cpi_ctx, force)?;
 
         Ok(())
     }
@@ -276,21 +290,13 @@ pub mod roulette_table {
         let bet = &mut ctx.accounts.bet;
 
         require!(bet.state == BetState::Pending, RouletteError::BetNotPending);
-
-        // TEMPORARILY DISABLED - use mock randomness for testing discriminator fix
-        // let mut data: &[u8] = &ctx.accounts.random.data.borrow();
-        // let randomness_state = RandomnessAccountData::try_deserialize(&mut data)
-        //     .map_err(|_| RouletteError::RandomnessDecodeFailed)?;
-        // let fulfilled = randomness_state.fulfilled_randomness();
-        // require!(fulfilled.is_some(), RouletteError::RandomnessNotFulfilled);
-        // let rnd = fulfilled.unwrap();
-        
-        // MOCK: Use bet.force as randomness for testing
-        let rnd: [u8; 64] = {
-            let mut arr = [0u8; 64];
-            arr[..32].copy_from_slice(&bet.force);
-            arr
-        };
+        // Read ORAO randomness account and ensure it's fulfilled
+        let mut data: &[u8] = &ctx.accounts.random.data.borrow();
+        let randomness_state = RandomnessAccountData::try_deserialize_unchecked(&mut data)
+            .map_err(|_| RouletteError::RandomnessDecodeFailed)?;
+        let fulfilled = randomness_state.fulfilled_randomness();
+        require!(fulfilled.is_some(), RouletteError::RandomnessNotFulfilled);
+        let rnd = fulfilled.unwrap();
 
         let n = roulette_number_from_randomness(&rnd);
 
@@ -303,14 +309,15 @@ pub mod roulette_table {
             0
         };
 
+
         if total_payout > 0 {
-            let seed_bytes = table.seed.to_le_bytes();
-            let bump = [table.bumps.table];
-            let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
+            // Sign as GlobalState PDA to move funds from the global vault
+            let gs = &mut ctx.accounts.global_state;
+            let signer_seeds: &[&[&[u8]]] = &[&[b"global", gs.usdc_mint.as_ref(), &[gs.bumps.global]]];
             let cpi_accounts = Transfer {
-                from: ctx.accounts.vault_usdc.to_account_info(),
+                from: ctx.accounts.global_vault_usdc.to_account_info(),
                 to: ctx.accounts.player_usdc_ata.to_account_info(),
-                authority: table.to_account_info(),
+                authority: gs.to_account_info(),
             };
             let cpi_ctx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -322,6 +329,9 @@ pub mod roulette_table {
 
         table.locked_liability = table.locked_liability.saturating_sub(bet.max_total_payout);
         table.active_bets = table.active_bets.saturating_sub(1);
+        let gs = &mut ctx.accounts.global_state;
+        gs.total_locked_liability = gs.total_locked_liability.saturating_sub(bet.max_total_payout);
+        gs.total_active_bets = gs.total_active_bets.saturating_sub(1);
 
         bet.state = BetState::Resolved;
         bet.result_number = Some(n);
@@ -341,13 +351,13 @@ pub mod roulette_table {
             RouletteError::BetNotExpired
         );
 
-        let seed_bytes = table.seed.to_le_bytes();
-        let bump = [table.bumps.table];
-        let signer_seeds: &[&[&[u8]]] = &[&[b"table", table.creator.as_ref(), &seed_bytes, &bump]];
+        // Refund from global vault (signed by GlobalState PDA)
+        let gs = &mut ctx.accounts.global_state;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"global", gs.usdc_mint.as_ref(), &[gs.bumps.global]]];
         let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_usdc.to_account_info(),
+            from: ctx.accounts.global_vault_usdc.to_account_info(),
             to: ctx.accounts.player_usdc_ata.to_account_info(),
-            authority: table.to_account_info(),
+            authority: gs.to_account_info(),
         };
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -358,6 +368,8 @@ pub mod roulette_table {
 
         table.locked_liability = table.locked_liability.saturating_sub(bet.max_total_payout);
         table.active_bets = table.active_bets.saturating_sub(1);
+        gs.total_locked_liability = gs.total_locked_liability.saturating_sub(bet.max_total_payout);
+        gs.total_active_bets = gs.total_active_bets.saturating_sub(1);
 
         bet.state = BetState::Refunded;
 
@@ -385,15 +397,6 @@ pub struct CreateTable<'info> {
     )]
     pub table: Account<'info, Table>,
 
-    #[account(
-        init,
-        payer = creator,
-        token::mint = usdc_mint,
-        token::authority = table,
-        seeds = [b"vault_usdc", table.key().as_ref()],
-        bump
-    )]
-    pub vault_usdc: Account<'info, TokenAccount>,
 
     #[account(
         init,
@@ -405,6 +408,36 @@ pub struct CreateTable<'info> {
     )]
     pub control_vault_gov: Account<'info, TokenAccount>,
 
+        /// Global state which holds the shared USDC vault
+        pub global_state: Account<'info, GlobalState>,
+
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct InitGlobal<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub usdc_mint: Account<'info, Mint>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + GlobalState::SIZE,
+        seeds = [b"global", usdc_mint.key().as_ref()],
+        bump
+    )]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(
+        init,
+        payer = payer,
+        token::mint = usdc_mint,
+        token::authority = global_state,
+        seeds = [b"global_vault_usdc", global_state.key().as_ref()],
+        bump
+    )]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
@@ -425,9 +458,9 @@ pub struct DepositLiquidityUsdc<'info> {
     #[account(mut)]
     pub operator_usdc_ata: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub table: Account<'info, Table>,
-    #[account(mut, address = table.vault_usdc)]
-    pub vault_usdc: Account<'info, TokenAccount>,
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut, address = global_state.vault_usdc)]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -439,8 +472,10 @@ pub struct WithdrawLiquidityUsdc<'info> {
     pub operator_usdc_ata: Account<'info, TokenAccount>,
     #[account(mut, has_one = operator)]
     pub table: Account<'info, Table>,
-    #[account(mut, address = table.vault_usdc)]
-    pub vault_usdc: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut, address = global_state.vault_usdc)]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -518,8 +553,10 @@ pub struct PlaceBet<'info> {
 
     #[account(mut)]
     pub table: Account<'info, Table>,
-    #[account(mut, address = table.vault_usdc)]
-    pub vault_usdc: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut, address = global_state.vault_usdc)]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
 
     #[account(
         init,
@@ -534,7 +571,8 @@ pub struct PlaceBet<'info> {
     #[account(
         mut,
         seeds = [RANDOMNESS_ACCOUNT_SEED, &force],
-        bump
+        bump,
+        seeds::program = orao_solana_vrf::ID
     )]
     pub random: AccountInfo<'info>,
 
@@ -542,16 +580,16 @@ pub struct PlaceBet<'info> {
     #[account(mut)]
     pub treasury: AccountInfo<'info>,
 
-    // TEMPORARILY DISABLED ORAO VRF TO FIX DISCRIMINATOR BUG
-    // #[account(
-    //     mut,
-    //     seeds = [CONFIG_ACCOUNT_SEED],
-    //     bump,
-    //     seeds::program = orao_solana_vrf::ID
-    // )]
-    // pub config: Account<'info, NetworkState>,
+    #[account(
+        mut,
+        seeds = [CONFIG_ACCOUNT_SEED],
+        bump,
+        seeds::program = orao_solana_vrf::ID
+    )]
+    /// CHECK: ORAO VRF config PDA (validated by seeds::program + seeds). We don't deserialize to avoid layout mismatches.
+    pub config: AccountInfo<'info>,
 
-    // pub vrf: Program<'info, OraoVrfProgram>,
+    pub vrf: Program<'info, OraoVrfProgram>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
@@ -568,8 +606,11 @@ pub struct ResolveBet<'info> {
 
     #[account(mut)]
     pub player_usdc_ata: Account<'info, TokenAccount>,
-    #[account(mut, address = table.vault_usdc)]
-    pub vault_usdc: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut, address = global_state.vault_usdc)]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
 
     /// CHECK: ORAO randomness request account
     #[account(mut, address = bet.randomness_account)]
@@ -589,8 +630,11 @@ pub struct RefundExpiredBet<'info> {
 
     #[account(mut)]
     pub player_usdc_ata: Account<'info, TokenAccount>,
-    #[account(mut, address = table.vault_usdc)]
-    pub vault_usdc: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub global_state: Account<'info, GlobalState>,
+    #[account(mut, address = global_state.vault_usdc)]
+    pub global_vault_usdc: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -617,7 +661,7 @@ pub struct Table {
 
     pub usdc_mint: Pubkey,
     pub gov_mint: Pubkey,
-    pub vault_usdc: Pubkey,
+    pub global_state: Pubkey,
     pub control_vault_gov: Pubkey,
 
     pub min_bet: u64,
@@ -652,11 +696,31 @@ pub enum TableMode {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct TableBumps {
     pub table: u8,
-    pub vault_usdc: u8,
     pub control_vault_gov: u8,
 }
 impl TableBumps {
-    pub const SIZE: usize = 1 + 1 + 1;
+    pub const SIZE: usize = 1 + 1;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct GlobalBumps {
+    pub global: u8,
+    pub vault_usdc: u8,
+}
+impl GlobalBumps {
+    pub const SIZE: usize = 1 + 1;
+}
+
+#[account]
+pub struct GlobalState {
+    pub usdc_mint: Pubkey,
+    pub vault_usdc: Pubkey,
+    pub total_locked_liability: u64,
+    pub total_active_bets: u64,
+    pub bumps: GlobalBumps,
+}
+impl GlobalState {
+    pub const SIZE: usize = 32 + 32 + 8 + 8 + GlobalBumps::SIZE;
 }
 
 #[account]

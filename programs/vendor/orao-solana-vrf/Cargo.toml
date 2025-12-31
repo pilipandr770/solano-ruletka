@@ -1,0 +1,12 @@
+[package]
+name = "orao-solana-vrf"
+version = "0.6.0-patched"
+edition = "2021"
+
+[dependencies]
+anchor-lang = { version = "0.31.1", default-features = false }
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]

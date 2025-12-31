@@ -20,5 +20,5 @@ default = []
 anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
 anchor-spl = "0.31.1"
 
-# ORAO VRF CPI temporarily commented to fix discriminator bug
-# orao-solana-vrf = { version = "0.6.1", default-features = false, features = ["cpi"] }
+# ORAO VRF CPI - use vendored local crate via path
+orao-solana-vrf = { path = "../vendor/orao-solana-vrf", default-features = false, features = ["cpi"] }

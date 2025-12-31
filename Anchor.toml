@@ -1,18 +1,24 @@
 [toolchain]
-anchor_version = "0.31.0"
+anchor_version = "0.31.1"
 solana_version = "2.1.0"
 
 [features]
-seeds = false
+resolution = true
 skip-lint = false
-no-idl = true
 
 [programs.devnet]
-roulette_table = "AV5r5GYG7adU9q1ojmyawExGtx2BAAqhtWa2AAXLNVa8"
+roulette_table = "ErfuhJxxpHNKviT5LCnupGhSUbXpjfRThxikEgb94aDt"
+
+[registry]
+url = "https://api.apr.dev"
 
 [provider]
 cluster = "devnet"
 wallet = "target/deploy/deployer-keypair.json"
 
+[workspace]
+members = ["programs/roulette_table"]
+exclude = ["programs/vendor"]
+
 [scripts]
-test = "npx mocha -t 1000000 tests/**/*.ts"
+test = "npx mocha -r ts-node/register/transpile-only --extension ts -t 1000000 tests/**/*.ts"

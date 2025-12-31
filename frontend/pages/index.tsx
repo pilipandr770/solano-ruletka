@@ -121,6 +121,23 @@ export default function Home() {
   const [lastBetPda, setLastBetPda] = useState<string>('')
   const [lastResult, setLastResult] = useState<{number: number, win: boolean, payout: number} | null>(null)
 
+  function multiplierForBetType(t: string): number {
+    switch (t) {
+      case 'straight': return 35
+      case 'split': return 17
+      case 'street': return 11
+      case 'corner': return 8
+      case 'red':
+      case 'black':
+        return 1
+      case 'dozen':
+      case 'column':
+        return 2
+      default:
+        return 1
+    }
+  }
+
   async function handlePlaceBetUI() {
     if (!publicKey) return alert('Connect wallet first')
     if (betType === 'straight' && selectedNumber === null) return alert('Select a number to bet on')
@@ -141,13 +158,48 @@ export default function Home() {
       let betKind: any = null
       if (betType === 'straight') betKind = { straight: { number: selectedNumber } }
       else if (betType === 'split') betKind = { split: { a: selectedPair[0], b: selectedPair[1] } }
-      else if (betType === 'street') betKind = { street: { row: Math.floor((selectedStreet[0] - 1) / 3) } } // assuming rows 0-11
-      else if (betType === 'corner') betKind = { corner: { row: Math.floor((selectedCorner[0] - 1) / 3), col: (selectedCorner[0] - 1) % 3 } } // rough
+      else if (betType === 'street') {
+        const row = Math.floor((selectedStreet[0] - 1) / 3) + 1 // program expects 1..12
+        betKind = { street: { row } }
+      }
+      else if (betType === 'corner') {
+        const tl = Math.min(...selectedCorner)
+        const row = Math.floor((tl - 1) / 3) + 1 // 1..11
+        const col = ((tl - 1) % 3) + 1 // 1..2
+        betKind = { corner: { row, col } }
+      }
       else if (betType === 'red') betKind = { red: {} }
       else if (betType === 'black') betKind = { black: {} }
-      else if (betType === 'dozen') betKind = { dozen: { idx: selectedNumber } }
-      else if (betType === 'column') betKind = { column: { idx: selectedNumber } }
-      const res = await anchorLib.placeBet(program, provider, { table, betKind, stake })
+      else if (betType === 'dozen') {
+        const idx = selectedNumber
+        if (idx !== 1 && idx !== 2 && idx !== 3) return alert('Dozen idx must be 1,2,3')
+        betKind = { dozen: { idx } }
+      }
+      else if (betType === 'column') {
+        const idx = selectedNumber
+        if (idx !== 1 && idx !== 2 && idx !== 3) return alert('Column idx must be 1,2,3')
+        betKind = { column: { idx } }
+      }
+      // UI is in USDC; program uses base units (6 decimals)
+      const stakeBase = Math.round(Number(stake) * 1_000_000)
+
+      // Preflight liquidity: required max payout must be available in global vault
+      const tableAcc: any = await (program.account as any).table.fetch(table)
+      const usdcMintPk = new PublicKey(tableAcc.usdcMint)
+      const mult = multiplierForBetType(betType)
+      const required = BigInt(stakeBase) * BigInt(mult + 1)
+      const liq = await anchorLib.getGlobalLiquidity(provider, program.programId, usdcMintPk, 'confirmed')
+      if (liq.available < required) {
+        const missing = required - liq.available
+        return alert(
+          `Insufficient liquidity for this bet.\n` +
+          `Vault available: ${Number(liq.available) / 1e6} USDC\n` +
+          `Required (max payout): ${Number(required) / 1e6} USDC\n` +
+          `Deposit at least: ${Number(missing) / 1e6} USDC (or lower stake / pick lower-multiplier bet).`
+        )
+      }
+
+      const res = await anchorLib.placeBet(program, provider, { table, betKind, stake: stakeBase })
       console.log('placeBet result', res)
       setLastBetPda(res.betPda)
       alert('placeBet transaction sent! Bet PDA: ' + res.betPda)
@@ -185,15 +237,24 @@ export default function Home() {
         let betKind: any = null
         if (b.type === 'straight') betKind = { straight: { number: b.value } }
         else if (b.type === 'split') betKind = { split: { a: b.value[0], b: b.value[1] } }
-        else if (b.type === 'street') betKind = { street: { row: Math.floor((b.value[0] - 1) / 3) } }
-        else if (b.type === 'corner') betKind = { corner: { row: Math.floor((b.value[0] - 1) / 3), col: (b.value[0] - 1) % 3 } }
+        else if (b.type === 'street') {
+          const row = Math.floor((b.value[0] - 1) / 3) + 1
+          betKind = { street: { row } }
+        }
+        else if (b.type === 'corner') {
+          const tl = Math.min(...b.value)
+          const row = Math.floor((tl - 1) / 3) + 1
+          const col = ((tl - 1) % 3) + 1
+          betKind = { corner: { row, col } }
+        }
         else if (b.type === 'red') betKind = { red: {} }
         else if (b.type === 'black') betKind = { black: {} }
         else if (b.type === 'dozen') betKind = { dozen: { idx: b.value } }
         else if (b.type === 'column') betKind = { column: { idx: b.value } }
         if (!betKind) throw new Error('Invalid bet in slip: ' + JSON.stringify(b))
         try {
-          await anchorLib.placeBet(program, provider, { table, betKind, stake: b.stake })
+          const stakeBase = Math.round(Number(b.stake) * 1_000_000)
+          await anchorLib.placeBet(program, provider, { table, betKind, stake: stakeBase })
         } catch (err:any) {
           console.error('placeBet failed for bet', b, err)
           throw err
@@ -255,8 +316,9 @@ export default function Home() {
                   usdcMint: process.env.NEXT_PUBLIC_USDC_MINT as string,
                   govMint: process.env.NEXT_PUBLIC_GOV_MINT as string,
                   mode: 0,
-                  minBet: 1,
-                  maxBet: 1000000,
+                  // base units (6 decimals)
+                  minBet: 10_000, // 0.01 USDC
+                  maxBet: 1_000_000_000, // 1000 USDC
                 })
                 console.log('createTable tx', res)
                 if (!process.env.NEXT_PUBLIC_PROGRAM_ID) throw new Error('NEXT_PUBLIC_PROGRAM_ID is missing')
@@ -304,15 +366,16 @@ export default function Home() {
                 placeholder="Amount (USDC)"
                 id="liquidityAmount"
                 style={{width:150}}
-                defaultValue={1000}
+                defaultValue={10}
               />
               <button onClick={async ()=>{
                 try {
                   if (!publicKey) return alert('Connect wallet first')
                   if (!tableAddress) return alert('Set table address first')
                   const { program, provider } = await ensureProgram()
-                  const amount = Number((document.getElementById('liquidityAmount') as HTMLInputElement)?.value || 0)
-                  if (!amount || amount <= 0) return alert('Enter valid amount')
+                  const amountUi = Number((document.getElementById('liquidityAmount') as HTMLInputElement)?.value || 0)
+                  if (!amountUi || amountUi <= 0) return alert('Enter valid amount')
+                  const amount = Math.round(amountUi * 1_000_000)
                   const table = new PublicKey(tableAddress)
                   await anchorLib.depositLiquidity(program, provider, { table, amount })
                   alert('Liquidity deposited successfully!')
@@ -369,16 +432,61 @@ export default function Home() {
                   // Check if randomness is fulfilled (optional)
                   const betInfo = await provider.connection.getAccountInfo(bet)
                   if (!betInfo) return alert('Bet account not found')
+
+                  // If it's already settled, don't send another tx; just show the result.
+                  try {
+                    let existing = await anchorLib.getBet(provider, bet, 'confirmed')
+                    if (!existing.isSettled) existing = await anchorLib.getBet(provider, bet, 'finalized')
+                    if (existing.isSettled && existing.resultNumber !== null) {
+                      const win = existing.payout > 0n
+                      alert(
+                        `Already resolved.\nResult: ${existing.resultNumber}\n` +
+                        (win ? `YOU WON! Payout: ${Number(existing.payout) / 1e6} USDC` : 'You lost.')
+                      )
+                      setLastResult({ number: existing.resultNumber, win, payout: Number(existing.payout) / 1e6 })
+                      return
+                    }
+                  } catch {
+                    // ignore; we'll try to resolve below
+                  }
+
+                  // Poll ORAO randomness before sending resolve tx to avoid RandomnessNotFulfilled
+                  try {
+                    let betData = await anchorLib.getBet(provider, bet, 'confirmed')
+                    const randomPda = betData.randomnessAccount
+                    const started = Date.now()
+                    while (Date.now() - started < 30_000) {
+                      const st = await anchorLib.getOraoRandomnessV2Fulfilled(provider, randomPda, 'confirmed')
+                      if (st.fulfilled) break
+                      await new Promise(r => setTimeout(r, 1500))
+                    }
+                    const st2 = await anchorLib.getOraoRandomnessV2Fulfilled(provider, randomPda, 'confirmed')
+                    if (!st2.fulfilled) {
+                      return alert('Randomness not fulfilled yet. Wait a bit more (5-15s) and try Resolve again.')
+                    }
+                  } catch (pollErr) {
+                    console.warn('Randomness poll warning:', pollErr)
+                    // If polling fails for any reason, we still try resolve; program will enforce fulfillment.
+                  }
                   
                   // Pass player explicitly to avoid decoding issues
                   const txSig = await anchorLib.resolveBet(program, provider, { table, bet, player: publicKey })
                   console.log('resolveBet tx:', txSig)
-                  
-                  // Wait for confirmation and read result
-                  await new Promise(resolve => setTimeout(resolve, 5000))
+
+                  // Confirm + read result (avoid stale reads)
+                  try {
+                    await provider.connection.confirmTransaction(txSig, 'confirmed')
+                  } catch (confirmErr) {
+                    console.warn('confirmTransaction warning:', confirmErr)
+                  }
+                  await new Promise(resolve => setTimeout(resolve, 1500))
                   
                   try {
-                    const betData = await anchorLib.getBet(provider, bet)
+                    let betData = await anchorLib.getBet(provider, bet, 'confirmed')
+                    if (!betData.isSettled) {
+                      // Some RPCs can lag on account state at lower commitments
+                      betData = await anchorLib.getBet(provider, bet, 'finalized')
+                    }
                     console.log('Bet state after resolve:', betData.isSettled ? 'Settled' : 'Pending', betData.resultNumber)
                     
                     if (betData.isSettled && betData.resultNumber !== null) {

@@ -20,6 +20,36 @@ export const ORAO_VRF_PROGRAM_ID = new PublicKey(
 const ORAO_CONFIG_SEED = 'orao-vrf-network-configuration'
 const ORAO_RANDOMNESS_SEED = 'orao-vrf-randomness-request'
 
+// ORAO RandomnessV2 layout (borsh via Anchor):
+// discriminator(8) + variant(u8) + client(32) + seed(32) + randomness(64)  [Fulfilled]
+// discriminator(8) + variant(u8) + client(32) + seed(32) + responses(vec)  [Pending]
+const ORAO_RANDOMNESS_V2_LEN_FULFILLED = 8 + 1 + 32 + 32 + 64
+
+export async function getOraoRandomnessV2Fulfilled(
+  provider: anchor.AnchorProvider,
+  randomPda: PublicKey,
+  commitment: anchor.web3.Commitment = 'confirmed'
+): Promise<{ fulfilled: boolean; randomness?: Uint8Array }>
+{
+  const info = await provider.connection.getAccountInfo(randomPda, commitment)
+  if (!info?.data) return { fulfilled: false }
+
+  // Ensure it's owned by ORAO program
+  if (!info.owner.equals(ORAO_VRF_PROGRAM_ID)) return { fulfilled: false }
+
+  const data = info.data
+  if (data.length < 9) return { fulfilled: false }
+
+  const variant = data[8]
+  // 0 = Pending, 1 = Fulfilled (see RequestAccount enum in our vendored crate)
+  if (variant !== 1) return { fulfilled: false }
+  if (data.length < ORAO_RANDOMNESS_V2_LEN_FULFILLED) return { fulfilled: false }
+
+  const randomnessOffset = 8 + 1 + 32 + 32
+  const rnd = data.slice(randomnessOffset, randomnessOffset + 64)
+  return { fulfilled: true, randomness: rnd }
+}
+
 /**
  * Minimal helpers to decode our Anchor accounts without a full IDL (accounts are not in frontend/idl).
  * We only decode fields we actually need in frontend flows.
@@ -130,7 +160,9 @@ type DecodedBet = {
   table: PublicKey
   player: PublicKey
   stake: bigint
+  multiplier: number
   kindTag: number
+  kindPayload: number[]
   createdTs: bigint
   force: Uint8Array
   randomnessAccount: PublicKey
@@ -158,6 +190,68 @@ function betKindPayloadLen(tag: number): number {
   }
 }
 
+function isRed(n: number): boolean {
+  // Standard European roulette red numbers
+  const red = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36])
+  return red.has(n)
+}
+
+function betCoversNumber(kindTag: number, payload: number[], n: number): boolean {
+  if (n < 0 || n > 36) return false
+
+  switch (kindTag) {
+    case 0: { // Straight { number }
+      return payload[0] === n
+    }
+    case 1: { // Split { a, b }
+      return payload[0] === n || payload[1] === n
+    }
+    case 2: { // Street { row }
+      if (n === 0) return false
+      const row = payload[0] ?? 0 // 1..12
+      const start = 3 * row - 2
+      return n >= start && n <= start + 2
+    }
+    case 3: { // Corner { row, col }
+      if (n === 0) return false
+      const row = payload[0] ?? 0 // 1..11
+      const col = payload[1] ?? 0 // 1..2
+      const tl = (row - 1) * 3 + col
+      const tr = tl + 1
+      const bl = tl + 3
+      const br = bl + 1
+      return n === tl || n === tr || n === bl || n === br
+    }
+    case 4: { // SixLine { row }
+      if (n === 0) return false
+      const row = payload[0] ?? 0 // 1..11
+      const start = 3 * row - 2
+      return n >= start && n <= start + 5
+    }
+    case 5: return n !== 0 && isRed(n) // Red
+    case 6: return n !== 0 && !isRed(n) // Black
+    case 7: return n !== 0 && (n % 2 === 0) // Even
+    case 8: return n !== 0 && (n % 2 === 1) // Odd
+    case 9: return n >= 1 && n <= 18 // Low
+    case 10: return n >= 19 && n <= 36 // High
+    case 11: { // Dozen { idx }
+      const idx = payload[0] ?? 0 // 1..3
+      if (idx === 1) return n >= 1 && n <= 12
+      if (idx === 2) return n >= 13 && n <= 24
+      if (idx === 3) return n >= 25 && n <= 36
+      return false
+    }
+    case 12: { // Column { idx }
+      const idx = payload[0] ?? 0 // 1..3
+      if (n === 0) return false
+      const col = ((n - 1) % 3) + 1
+      return idx === col
+    }
+    default:
+      return false
+  }
+}
+
 function decodeBetAccount(data: Uint8Array): DecodedBet {
   console.log('Raw BetAccount data len:', data.length)
   console.log('Raw hex:', Buffer.from(data).toString('hex'))
@@ -173,9 +267,13 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
 
   const kindTag = readU8(data, o); o = kindTag.next
   console.log('Decoded kindTag:', kindTag.value)
-  
+
   const payloadLen = betKindPayloadLen(kindTag.value)
   console.log('Payload len:', payloadLen)
+  const kindPayload: number[] = []
+  for (let i = 0; i < payloadLen; i++) {
+    kindPayload.push(data[o + i])
+  }
   o += payloadLen
 
   const state = readU8(data, o); o = state.next
@@ -197,16 +295,25 @@ function decodeBetAccount(data: Uint8Array): DecodedBet {
       console.log('Decoded resultNumber:', resultNumber)
   }
 
+  // We don't persist payout on-chain; compute it from (stake, multiplier, kind, resultNumber)
+  let payout = 0n
+  if (state.value === 1 && resultNumber !== null) {
+    const won = betCoversNumber(kindTag.value, kindPayload, resultNumber)
+    payout = won ? stake.value * BigInt(multiplier.value + 1) : 0n
+  }
+
   return {
     table: table.value,
     player: player.value,
     stake: stake.value,
+    multiplier: multiplier.value,
     kindTag: kindTag.value,
+    kindPayload,
     createdTs: createdTs.value,
     force,
     randomnessAccount: randomnessAccount.value,
     resultNumber,
-    payout: 0n, // Not in struct
+    payout,
     isSettled: state.value !== 0 // Pending=0
   }
 }
@@ -244,6 +351,84 @@ export async function initProgram(idl: any, programId: PublicKey, provider: anch
   return { program, provider }
 }
 
+export function deriveGlobalStatePdas(programId: PublicKey, usdcMint: PublicKey) {
+  const [globalState] = PublicKey.findProgramAddressSync(
+    [Buffer.from('global'), usdcMint.toBuffer()],
+    programId
+  )
+  const [globalVaultUsdc] = PublicKey.findProgramAddressSync(
+    [Buffer.from('global_vault_usdc'), globalState.toBuffer()],
+    programId
+  )
+  return { globalState, globalVaultUsdc }
+}
+
+export async function getGlobalLiquidity(
+  provider: anchor.AnchorProvider,
+  programId: PublicKey,
+  usdcMint: PublicKey,
+  commitment: anchor.web3.Commitment = 'confirmed'
+): Promise<{
+  globalState: PublicKey
+  globalVaultUsdc: PublicKey
+  vaultBalance: bigint
+  lockedLiability: bigint
+  available: bigint
+}> {
+  const { globalState, globalVaultUsdc } = deriveGlobalStatePdas(programId, usdcMint)
+
+  const bal = await provider.connection.getTokenAccountBalance(globalVaultUsdc, commitment)
+  const vaultBalance = BigInt(bal.value.amount)
+
+  const info = await provider.connection.getAccountInfo(globalState, commitment)
+  if (!info?.data) {
+    return {
+      globalState,
+      globalVaultUsdc,
+      vaultBalance,
+      lockedLiability: 0n,
+      available: vaultBalance,
+    }
+  }
+
+  const data = info.data
+  // Anchor discriminator (8) + usdc_mint (32) + vault (32) + locked (8)
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  const locked = view.getBigUint64(8 + 32 + 32, true)
+
+  const lockedLiability = BigInt(locked.toString())
+  const available = vaultBalance > lockedLiability ? (vaultBalance - lockedLiability) : 0n
+
+  return { globalState, globalVaultUsdc, vaultBalance, lockedLiability, available }
+}
+
+async function ensureGlobalInitialized(
+  program: anchor.Program,
+  provider: anchor.AnchorProvider,
+  usdcMint: PublicKey
+) {
+  const payer = provider.wallet.publicKey
+  const { globalState, globalVaultUsdc } = deriveGlobalStatePdas(program.programId, usdcMint)
+
+  const info = await provider.connection.getAccountInfo(globalState, 'confirmed')
+  if (info) return { globalState, globalVaultUsdc }
+
+  await program.methods
+    .initGlobal()
+    .accounts({
+      payer,
+      usdcMint,
+      globalState,
+      globalVaultUsdc,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    })
+    .rpc()
+
+  return { globalState, globalVaultUsdc }
+}
+
 export async function createTable(
   program: anchor.Program,
   provider: anchor.AnchorProvider,
@@ -266,14 +451,11 @@ export async function createTable(
   const usdcMintPk = new PublicKey(params.usdcMint)
   const govMintPk = new PublicKey(params.govMint)
 
+  const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
+
   const seedBuf = seedBn.toArrayLike(Buffer, 'le', 8)
   const [tablePda] = PublicKey.findProgramAddressSync(
     [Buffer.from('table'), payer.toBuffer(), seedBuf],
-    program.programId
-  )
-
-  const [vaultUsdcPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from('vault_usdc'), tablePda.toBuffer()],
     program.programId
   )
 
@@ -282,47 +464,30 @@ export async function createTable(
     program.programId
   )
 
-  // Build instruction manually to force correct account metas
-  const ix = await program.methods
-    .createTable(seedBn, mode, minB, maxB)
+  // Frontend passes mode as number; program expects TableMode enum
+  const modeEnum: any = mode === 1 ? { public: {} } : { private: {} }
+
+  const txSig = await program.methods
+    .createTable(seedBn, modeEnum, minB, maxB)
     .accounts({
       creator: payer,
-      operator: payer,
-      table: tablePda,
       usdcMint: usdcMintPk,
       govMint: govMintPk,
-      vaultUsdc: vaultUsdcPda,
+      table: tablePda,
       controlVaultGov: controlVaultGovPda,
+      globalState,
       systemProgram: SystemProgram.programId,
       tokenProgram: TOKEN_PROGRAM_ID,
       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
     })
-    .instruction()
-
-  // Force signer/writable flags (IDL lacks account metadata)
-  const signerSet = new Set<string>([payer.toBase58()])
-  const writableSet = new Set<string>([
-    payer.toBase58(),
-    tablePda.toBase58(),
-    vaultUsdcPda.toBase58(),
-    controlVaultGovPda.toBase58(),
-  ])
-  
-  ix.keys = ix.keys.map((k) => ({
-    ...k,
-    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
-    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
-  }))
-
-  const tx = new anchor.web3.Transaction().add(ix)
-  tx.feePayer = payer
-  const txSig = await provider.sendAndConfirm(tx, [])
+    .rpc()
 
   return {
     txSig,
     tablePda: tablePda.toBase58(),
-    vaultUsdcPda: vaultUsdcPda.toBase58(),
     controlVaultGovPda: controlVaultGovPda.toBase58(),
+    globalStatePda: globalState.toBase58(),
+    globalVaultUsdcPda: globalVaultUsdc.toBase58(),
   }
 }
 
@@ -337,53 +502,23 @@ export async function depositLiquidity(
 ) {
   const operator = provider.wallet.publicKey
 
+  const tableAcc: any = await (program.account as any).table.fetch(args.table)
+  const usdcMintPk = new PublicKey(tableAcc.usdcMint)
   const operatorUsdcAta =
-    args.operatorUsdcAta ??
-    getAssociatedTokenAddressSync(
-      (await (async () => {
-        const info = await provider.connection.getAccountInfo(args.table)
-        if (!info?.data) throw new Error('Table account not found')
-        const t = decodeTableAccount(info.data)
-        return t.usdcMint
-      })()),
-      operator
-    )
+    args.operatorUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, operator)
 
-  const [vaultUsdc] = PublicKey.findProgramAddressSync(
-    [Buffer.from('vault_usdc'), args.table.toBuffer()],
-    program.programId
-  )
+  const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
-  // Build instruction manually to force correct account metas
-  const ix = await program.methods
+  return program.methods
     .depositLiquidityUsdc(new anchor.BN(args.amount))
     .accounts({
       operator,
       operatorUsdcAta,
-      table: args.table,
-      vaultUsdc,
+      globalState,
+      globalVaultUsdc,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
-    .instruction()
-
-  // Force signer/writable flags
-  const signerSet = new Set<string>([operator.toBase58()])
-  const writableSet = new Set<string>([
-    operator.toBase58(),
-    operatorUsdcAta.toBase58(),
-    args.table.toBase58(),
-    vaultUsdc.toBase58(),
-  ])
-  
-  ix.keys = ix.keys.map((k) => ({
-    ...k,
-    isSigner: signerSet.has(k.pubkey.toBase58()) || k.isSigner,
-    isWritable: writableSet.has(k.pubkey.toBase58()) || k.isWritable,
-  }))
-
-  const tx = new anchor.web3.Transaction().add(ix)
-  tx.feePayer = operator
-  return provider.sendAndConfirm(tx, [])
+    .rpc()
 }
 
 export async function placeBet(
@@ -398,12 +533,8 @@ export async function placeBet(
 ) {
   const player = provider.wallet.publicKey
 
-  const tableInfo = await provider.connection.getAccountInfo(args.table)
-  if (!tableInfo?.data) throw new Error('Table account not found')
-  const table = decodeTableAccount(tableInfo.data)
-
-  const betSeq = table.betSeq
-  const betSeqBn = new anchor.BN(betSeq.toString(10))
+  const tableAcc: any = await (program.account as any).table.fetch(args.table)
+  const betSeqBn = new anchor.BN(tableAcc.betSeq)
 
   const [betPda] = PublicKey.findProgramAddressSync(
     [
@@ -428,108 +559,36 @@ export async function placeBet(
 
   const force = randomForce32()
 
-  // Random PDA uses YOUR program ID (not ORAO's) since we commented out ORAO VRF
+
+  // ORAO randomness PDA must be derived with ORAO program id
   const [randomPda] = PublicKey.findProgramAddressSync(
     [Buffer.from(ORAO_RANDOMNESS_SEED), Buffer.from(force)],
-    program.programId
+    ORAO_VRF_PROGRAM_ID
   )
 
-  const usdcMint = table.usdcMint
+  const usdcMintPk = new PublicKey(tableAcc.usdcMint)
   const playerUsdcAta =
-    args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMint, player)
+    args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, player)
 
-  // Build instruction COMPLETELY MANUALLY to bypass IDL validation
-  // This is necessary because deployed program removed config/vrf but IDL still has them
-  
-  // Discriminator is SHA256("global:place_bet")[0..8]
-  // sha256("global:place_bet") = de3e43dc3fa67e21...
-  const discriminator = Buffer.from([0xde, 0x3e, 0x43, 0xdc, 0x3f, 0xa6, 0x7e, 0x21])
-  
-  // Serialize bet kind (Borsh enum serialization: 1-byte variant + fields)
-  // Variants: Straight=0, Split=1, Street=2, Corner=3, SixLine=4, Red=5, Black=6, Even=7, Odd=8, Low=9, High=10, Dozen=11, Column=12
-  // Frontend passes: { straight: { number: 5 } }, { red: {} }, { split: { a: 1, b: 2 } }, etc.
-  let betData: Buffer
-  if (args.betKind.hasOwnProperty('straight')) {
-    // Straight variant (0) + u8 number
-    betData = Buffer.alloc(2)
-    betData[0] = 0
-    betData[1] = (args.betKind as any).straight.number
-  } else if (args.betKind.hasOwnProperty('split')) {
-    // Split variant (1) + u8 a + u8 b
-    betData = Buffer.alloc(3)
-    betData[0] = 1
-    betData[1] = (args.betKind as any).split.a
-    betData[2] = (args.betKind as any).split.b
-  } else if (args.betKind.hasOwnProperty('street')) {
-    // Street variant (2) + u8 row
-    betData = Buffer.alloc(2)
-    betData[0] = 2
-    betData[1] = (args.betKind as any).street.row
-  } else if (args.betKind.hasOwnProperty('corner')) {
-    // Corner variant (3) + u8 row + u8 col
-    betData = Buffer.alloc(3)
-    betData[0] = 3
-    betData[1] = (args.betKind as any).corner.row
-    betData[2] = (args.betKind as any).corner.col
-  } else if (args.betKind.hasOwnProperty('sixLine')) {
-    // SixLine variant (4) + u8 row
-    betData = Buffer.alloc(2)
-    betData[0] = 4
-    betData[1] = (args.betKind as any).sixLine.row
-  } else if (args.betKind.hasOwnProperty('red')) {
-    betData = Buffer.from([5]) // Red variant
-  } else if (args.betKind.hasOwnProperty('black')) {
-    betData = Buffer.from([6]) // Black variant
-  } else if (args.betKind.hasOwnProperty('even')) {
-    betData = Buffer.from([7]) // Even variant
-  } else if (args.betKind.hasOwnProperty('odd')) {
-    betData = Buffer.from([8]) // Odd variant
-  } else if (args.betKind.hasOwnProperty('low')) {
-    betData = Buffer.from([9]) // Low variant
-  } else if (args.betKind.hasOwnProperty('high')) {
-    betData = Buffer.from([10]) // High variant
-  } else if (args.betKind.hasOwnProperty('dozen')) {
-    // Dozen variant (11) + u8 idx
-    betData = Buffer.alloc(2)
-    betData[0] = 11
-    betData[1] = (args.betKind as any).dozen.idx
-  } else if (args.betKind.hasOwnProperty('column')) {
-    // Column variant (12) + u8 idx
-    betData = Buffer.alloc(2)
-    betData[0] = 12
-    betData[1] = (args.betKind as any).column.idx
-  } else {
-    throw new Error('Unknown bet kind')
-  }
-  
-  // Serialize stake (u64 LE)
-  const stakeBuf = Buffer.alloc(8)
-  stakeBuf.writeBigUInt64LE(BigInt(args.stake))
-  
-  // Serialize force ([u8; 32])
-  const forceBuf = Buffer.from(force)
-  
-  const data = Buffer.concat([discriminator, betData, stakeBuf, forceBuf])
-  
-  const ix = new anchor.web3.TransactionInstruction({
-    programId: program.programId,
-    keys: [
-      { pubkey: player, isSigner: true, isWritable: true },
-      { pubkey: playerUsdcAta, isSigner: false, isWritable: true },
-      { pubkey: args.table, isSigner: false, isWritable: true },
-      { pubkey: table.vaultUsdc, isSigner: false, isWritable: true },
-      { pubkey: betPda, isSigner: false, isWritable: true },
-      { pubkey: randomPda, isSigner: false, isWritable: true },
-      { pubkey: treasury, isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ],
-    data,
-  })
+  const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
-  const tx = new anchor.web3.Transaction().add(ix)
-  tx.feePayer = player
-  const txSig = await provider.sendAndConfirm(tx, [])
+  const txSig = await program.methods
+    .placeBet(args.betKind, new anchor.BN(args.stake), Array.from(force) as any)
+    .accounts({
+      player,
+      playerUsdcAta,
+      table: args.table,
+      globalState,
+      globalVaultUsdc,
+      bet: betPda,
+      random: randomPda,
+      treasury,
+      config: configPda,
+      vrf: ORAO_VRF_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .rpc()
 
   return {
     txSig,
@@ -551,42 +610,30 @@ export async function resolveBet(
 ) {
   const resolver = provider.wallet.publicKey
 
-  const tableInfo = await provider.connection.getAccountInfo(args.table)
-  if (!tableInfo?.data) throw new Error('Table account not found')
-  const table = decodeTableAccount(tableInfo.data)
+  const tableAcc: any = await (program.account as any).table.fetch(args.table)
+  const betAcc: any = await (program.account as any).betAccount.fetch(args.bet)
 
-  const betInfo = await provider.connection.getAccountInfo(args.bet)
-  if (!betInfo?.data) throw new Error('Bet account not found')
-  const bet = decodeBetAccount(betInfo.data)
-
-  const player = args.player ?? bet.player
+  const player = args.player ?? new PublicKey(betAcc.player)
+  const usdcMintPk = new PublicKey(tableAcc.usdcMint)
   const playerUsdcAta =
-    args.playerUsdcAta ?? getAssociatedTokenAddressSync(table.usdcMint, player)
+    args.playerUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, player)
 
-  const random = bet.randomnessAccount
+  const random = new PublicKey(betAcc.randomnessAccount)
+  const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
-  // Build instruction manually to force correct account metas and bypass IDL
-  // Discriminator for "global:resolve_bet"
-  // sha256("global:resolve_bet") = 8984216130d01e9f...
-  const discriminator = Buffer.from([0x89, 0x84, 0x21, 0x61, 0x30, 0xd0, 0x1e, 0x9f])
-
-  const ix = new anchor.web3.TransactionInstruction({
-    programId: program.programId,
-    keys: [
-      { pubkey: resolver, isSigner: true, isWritable: true },
-      { pubkey: args.table, isSigner: false, isWritable: true },
-      { pubkey: args.bet, isSigner: false, isWritable: true },
-      { pubkey: playerUsdcAta, isSigner: false, isWritable: true },
-      { pubkey: table.vaultUsdc, isSigner: false, isWritable: true },
-      { pubkey: random, isSigner: false, isWritable: true }, // random account
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ],
-    data: discriminator
-  })
-
-  const tx = new anchor.web3.Transaction().add(ix)
-  tx.feePayer = resolver
-  return provider.sendAndConfirm(tx, [])
+  return program.methods
+    .resolveBet()
+    .accounts({
+      resolver,
+      table: args.table,
+      bet: args.bet,
+      playerUsdcAta,
+      globalState,
+      globalVaultUsdc,
+      random,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .rpc()
 }
 
 export async function refundExpired(
@@ -622,15 +669,19 @@ export async function refundExpired(
 
 export async function getBet(
   provider: anchor.AnchorProvider,
-  betPda: PublicKey
+  betPda: PublicKey,
+  commitment: anchor.web3.Commitment = 'finalized'
 ): Promise<DecodedBet> {
-  const info = await provider.connection.getAccountInfo(betPda)
+  const info = await provider.connection.getAccountInfo(betPda, commitment)
   if (!info?.data) throw new Error('Bet account not found')
   return decodeBetAccount(info.data)
 }
 
 export default {
   initProgram,
+  deriveGlobalStatePdas,
+  getGlobalLiquidity,
+  getOraoRandomnessV2Fulfilled,
   createTable,
   depositLiquidity,
   placeBet,
