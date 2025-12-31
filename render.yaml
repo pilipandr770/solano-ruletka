@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: solano-ruletka-frontend
+    env: node
+    rootDir: frontend
+    plan: free
+    buildCommand: npm ci && npm run build
+    # Render provides $PORT; Next should listen on it.
+    startCommand: npm run start -- -p $PORT
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Pin Node version to avoid surprises. Render supports this env var.
+      - key: NODE_VERSION
+        value: 20
+      # ---- Public runtime config (exposed to browser) ----
+      # Set these in Render dashboard (recommended) or here if you want them committed.
+      - key: NEXT_PUBLIC_RPC_URL
+        sync: false
+      - key: NEXT_PUBLIC_PROGRAM_ID
+        sync: false
+      - key: NEXT_PUBLIC_USDC_MINT
+        sync: false
+      - key: NEXT_PUBLIC_GOV_MINT
+        sync: false
+      - key: NEXT_PUBLIC_ORAO_PROGRAM_ID
+        sync: false
+      - key: NEXT_PUBLIC_CLUSTER
+        sync: false
+      # Optional: pin a single table PDA so players never see/edit it.
+      - key: NEXT_PUBLIC_TABLE_PDA
+        sync: false

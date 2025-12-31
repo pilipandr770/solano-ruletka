@@ -5,6 +5,8 @@ import * as anchor from '@coral-xyz/anchor'
 import anchorLib from '../lib/anchor'
 import dynamic from 'next/dynamic'
 import idl from '../idl/roulette_table.json'
+import SiteFooter from '../components/SiteFooter'
+import SiteHeader from '../components/SiteHeader'
 const RouletteBoard = dynamic(() => import('../components/RouletteBoardFixed'), { ssr: false })
 
 declare global {
@@ -581,28 +583,44 @@ export default function Home() {
           to { transform: rotate(360deg); }
         }
       `}</style>
-      <main style={{maxWidth:900,margin:'40px auto',padding:'0 20px',fontFamily:'Inter, Arial'}}>
-        <header style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-          <h1 style={{margin:0}}>Provably-Fair Roulette  Table</h1>
-          <div>
-            {publicKey ? (<span style={{display:'flex',gap:8,alignItems:'center'}}><span>{publicKey.toBase58().slice(0,6)}...{publicKey.toBase58().slice(-6)}</span><button onClick={disconnect}>Disconnect</button></span>) : (<button onClick={connect}>Connect Phantom</button>)}
-          </div>
-        </header>
+      <main className="container">
+        <SiteHeader showAdminLink={isFunctionalTokenOwner} />
 
-        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
-          <h2>Status</h2>
-          <div>Cluster: {process.env.NEXT_PUBLIC_CLUSTER||'devnet'}</div>
-          <div>Program: {process.env.NEXT_PUBLIC_PROGRAM_ID}</div>
-          <div>RPC: {rpcUrl}</div>
-          <div>Wallet: {publicKey ? publicKey.toBase58() : 'Not connected'}</div>
-          <div>SOL: {balance!==null?balance.toFixed(4):''}</div>
+        <section className="card">
+          <div className="space-between">
+            <div>
+              <h2 style={{margin:'0 0 6px 0'}}>Wallet & Network</h2>
+              <div className="muted" style={{fontSize:13}}>
+                {process.env.NEXT_PUBLIC_CLUSTER || 'devnet'} • provably-fair VRF roulette demo
+              </div>
+            </div>
+            <div className="row">
+              {publicKey ? (
+                <>
+                  <div className="muted" style={{fontSize:13}}>
+                    {publicKey.toBase58().slice(0,6)}…{publicKey.toBase58().slice(-6)}
+                  </div>
+                  <button className="btn-secondary" onClick={disconnect}>Disconnect</button>
+                </>
+              ) : (
+                <button onClick={connect}>Connect Phantom</button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-2" style={{marginTop:14}}>
+            <div className="kv"><strong>RPC:</strong> <span style={{wordBreak:'break-all'}}>{rpcUrl}</span></div>
+            <div className="kv"><strong>Program:</strong> <span style={{wordBreak:'break-all'}}>{process.env.NEXT_PUBLIC_PROGRAM_ID}</span></div>
+            <div className="kv"><strong>Wallet:</strong> <span style={{wordBreak:'break-all'}}>{publicKey ? publicKey.toBase58() : 'Not connected'}</span></div>
+            <div className="kv"><strong>SOL:</strong> {balance!==null ? balance.toFixed(4) : '—'}</div>
+          </div>
         </section>
 
-        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
+        <section className="card">
           <h2>Table</h2>
           {isFunctionalTokenOwner ? (
-            <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
-              <label style={{display:'flex',gap:8,alignItems:'center'}}>
+            <div className="row">
+              <label className="row" style={{gap:8}}>
                 Table number (seed):
                 <input
                   type="number"
@@ -647,7 +665,7 @@ export default function Home() {
               }}>Create Table</button>
             </div>
           ) : (
-            <div style={{fontSize:13,color:'#666'}}>
+            <div className="muted" style={{fontSize:13}}>
               Table creation is available only to functional-token owners.
             </div>
           )}
@@ -674,9 +692,9 @@ export default function Home() {
           </div>
 
           {(isOperator && govBalanceUi >= OPERATOR_THRESHOLD) ? (
-            <div style={{marginTop:16,padding:12,background:'#fff3cd',borderRadius:6}}>
+            <div className="notice" style={{marginTop:16,background:'#fff3cd',borderColor:'rgba(0,0,0,0.08)'}}>
               <h3 style={{margin:'0 0 8px 0',fontSize:15}}>Deposit Liquidity (Required before bets)</h3>
-              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+              <div className="row">
                 <input
                   type="number"
                   placeholder="Amount (USDC)"
@@ -700,10 +718,10 @@ export default function Home() {
                     alert('depositLiquidity failed: ' + (e?.message || e))
                   }
                 }}>Deposit Liquidity</button>
-                <span style={{fontSize:13,color:'#856404'}}>Operators must fund the vault before players can bet</span>
+                <span className="muted" style={{fontSize:13}}>Operators must fund the vault before players can bet</span>
               </div>
 
-              <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginTop:10}}>
+              <div className="row" style={{marginTop:10}}>
                 <input
                   type="number"
                   placeholder="Withdraw (USDC)"
@@ -727,13 +745,13 @@ export default function Home() {
                     alert('withdraw failed: ' + (e?.message || e))
                   }
                 }}>Withdraw Liquidity</button>
-                <span style={{fontSize:13,color:'#856404'}}>Withdraw rules depend on table mode (PUBLIC has delay)</span>
+                <span className="muted" style={{fontSize:13}}>Withdraw rules depend on table mode (PUBLIC has delay)</span>
               </div>
             </div>
           ) : null}
         </section>
 
-        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
+        <section className="card">
           <h2>Resolve Bet (Spin Roulette)</h2>
           <div style={{display:'flex',gap:18,alignItems:'center',flexWrap:'wrap',marginBottom:12}}>
             <div
@@ -821,30 +839,7 @@ export default function Home() {
                 {spinPhase === 'idle' && 'Ready'}
               </div>
               {uiNotice && (
-                <div
-                  style={{
-                    padding: 10,
-                    borderRadius: 8,
-                    background:
-                      uiNotice.kind === 'success'
-                        ? '#d4edda'
-                        : uiNotice.kind === 'error'
-                          ? '#f8d7da'
-                          : '#d1ecf1',
-                    color:
-                      uiNotice.kind === 'success'
-                        ? '#155724'
-                        : uiNotice.kind === 'error'
-                          ? '#721c24'
-                          : '#0c5460',
-                    border:
-                      uiNotice.kind === 'success'
-                        ? '1px solid #c3e6cb'
-                        : uiNotice.kind === 'error'
-                          ? '1px solid #f5c6cb'
-                          : '1px solid #bee5eb',
-                  }}
-                >
+                <div className={`notice ${uiNotice.kind === 'success' ? 'notice-success' : uiNotice.kind === 'error' ? 'notice-danger' : 'notice-info'}`}>
                   {uiNotice.text}
                 </div>
               )}
@@ -857,7 +852,7 @@ export default function Home() {
               )}
             </div>
           </div>
-          <div style={{padding:12,background:'#d1ecf1',borderRadius:6}}>
+          <div className="notice notice-info">
             <p style={{margin:'0 0 12px 0',fontSize:14}}>
               Сначала делаем ставку. Затем ORAO VRF подтверждает случайность (это защищает от подкрутки). Когда будет готово — нажми SPIN.
             </p>
@@ -1013,17 +1008,10 @@ export default function Home() {
           </div>
         </section>
 
-        <section style={{background:'#fff',borderRadius:8,padding:18,marginTop:20}}>
+        <section className="card">
           <h2>Place a bet</h2>
           {lastResult && (
-            <div style={{
-              marginBottom: 20, 
-              padding: 15, 
-              borderRadius: 8, 
-              background: lastResult.win ? '#d4edda' : '#f8d7da',
-              color: lastResult.win ? '#155724' : '#721c24',
-              border: `1px solid ${lastResult.win ? '#c3e6cb' : '#f5c6cb'}`
-            }}>
+            <div className={`notice ${lastResult.win ? 'notice-success' : 'notice-danger'}`} style={{marginBottom: 20}}>
               <h3 style={{margin:0}}>Last Spin Result: {lastResult.number}</h3>
               <p style={{margin:'5px 0 0'}}>
                 {lastResult.win 
@@ -1033,7 +1021,7 @@ export default function Home() {
             </div>
           )}
           <div style={{display:'flex',gap:24,alignItems:'flex-start',flexWrap:'wrap'}}>
-            <div>
+            <div style={{flex:'1 1 1024px', maxWidth:'100%', overflowX:'auto'}}>
               {/* Bet-type buttons removed — the board itself handles bet selection */}
 
               <RouletteBoard
@@ -1057,13 +1045,13 @@ export default function Home() {
               />
             </div>
 
-            <div style={{minWidth:260}}>
+            <div style={{flex:'1 1 280px', minWidth:260}}>
               <div style={{marginBottom:8}}>Selected: {selectionDisplay}</div>
               <div style={{marginBottom:8}}>Stake (USDC): <input type="number" value={stake} min={1} onChange={(e)=>setStake(Number(e.target.value||1))} style={{width:120}} /></div>
               <div style={{display:'flex',gap:8}}>
                 <button onClick={handlePlaceBetUI}>Place Bet</button>
-                <button onClick={addToSlip}>Add Chip</button>
-                <button onClick={()=>{ setSelectedNumber(null); setStake(1) }}>Clear</button>
+                <button className="btn-secondary" onClick={addToSlip}>Add Chip</button>
+                <button className="btn-danger" onClick={()=>{ setSelectedNumber(null); setStake(1) }}>Clear</button>
               </div>
               <div style={{marginTop:12}}>
                 <h3 style={{margin:'8px 0'}}>Bet Slip ({betSlip.length})</h3>
@@ -1073,16 +1061,18 @@ export default function Home() {
                       <div style={{fontSize:13}}>{b.type} {Array.isArray(b.value)? JSON.stringify(b.value):String(b.value)}</div>
                       <div style={{display:'flex',gap:8,alignItems:'center'}}>
                         <input type="number" value={b.stake||stake} min={1} onChange={(e)=>{ const s=Number(e.target.value||1); setBetSlip(prev=>prev.map((p,idx)=> idx===i? {...p, stake: s}:p)) }} style={{width:80}} />
-                        <button onClick={()=>setBetSlip(prev=>prev.filter((_,idx)=>idx!==i))}>Remove</button>
+                        <button className="btn-secondary" onClick={()=>setBetSlip(prev=>prev.filter((_,idx)=>idx!==i))}>Remove</button>
                       </div>
                     </div>
                   ))}
-                  {betSlip.length===0 && <div style={{color:'#666'}}>No chips placed</div>}
+                  {betSlip.length===0 && <div className="muted">No chips placed</div>}
                 </div>
               </div>
             </div>
           </div>
         </section>
+
+        <SiteFooter />
       </main>
     </div>
   )
