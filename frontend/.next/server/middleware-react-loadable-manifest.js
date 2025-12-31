@@ -1,1 +1,1 @@
-self.__REACT_LOADABLE_MANIFEST="{\"index.tsx -> ../components/RouletteBoardFixed\":{\"id\":\"index.tsx -> ../components/RouletteBoardFixed\",\"files\":[\"static/chunks/components_RouletteBoardFixed_tsx.js\"]}}"
+self.__REACT_LOADABLE_MANIFEST='{"pages\\\\index.tsx -> ../components/RouletteBoardFixed":{"id":423,"files":["static/chunks/423.95d0b692f512ef21.js"]}}';

@@ -123,7 +123,33 @@ export default function Home() {
 
   const envGovMint = process.env.NEXT_PUBLIC_GOV_MINT
   const envTablePda = process.env.NEXT_PUBLIC_TABLE_PDA
-  const tableAddressIsPinned = Boolean(envTablePda)
+  const envTablePdasRaw = process.env.NEXT_PUBLIC_TABLE_PDAS || ''
+  const hasEnvTableList = Boolean(envTablePdasRaw.trim())
+  const envTablePdas = useMemo(() => {
+    const candidates = [envTablePda, ...envTablePdasRaw.split(/[\s,]+/g)].filter(Boolean) as string[]
+    const uniq = new Set<string>()
+    const out: string[] = []
+    for (const raw of candidates) {
+      const v = String(raw).trim()
+      if (!v) continue
+      if (uniq.has(v)) continue
+      try {
+        // Validate base58 + length
+        // eslint-disable-next-line no-new
+        new PublicKey(v)
+      } catch {
+        continue
+      }
+      uniq.add(v)
+      out.push(v)
+    }
+    return out
+  }, [envTablePda, envTablePdasRaw])
+
+  // Backward compatible behavior:
+  // - If only NEXT_PUBLIC_TABLE_PDA is set => pinned (no switching)
+  // - If NEXT_PUBLIC_TABLE_PDAS is set => show selector
+  const tableAddressIsPinned = Boolean(envTablePda) && !hasEnvTableList
   const isFunctionalTokenOwner = govBalanceEnvUi >= OPERATOR_THRESHOLD
 
   // Read GOV balance directly from env mint (works even before a table exists)
@@ -147,6 +173,30 @@ export default function Home() {
   }, [publicKey?.toBase58(), envGovMint])
 
   const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
+
+  // If a table list is provided, default to saved selection (or first in list)
+  useEffect(() => {
+    if (!hasEnvTableList) return
+    try {
+      const saved = window.localStorage.getItem('selectedTablePda')?.trim()
+      if (saved && envTablePdas.includes(saved)) {
+        setTableAddress(saved)
+        return
+      }
+    } catch {}
+
+    if (envTablePdas.length > 0 && !tableAddress) {
+      setTableAddress(envTablePdas[0])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasEnvTableList, envTablePdas])
+
+  const tableSelectOptions = useMemo(() => {
+    if (!hasEnvTableList) return []
+    if (!tableAddress) return envTablePdas
+    if (envTablePdas.includes(tableAddress)) return envTablePdas
+    return [tableAddress, ...envTablePdas]
+  }, [hasEnvTableList, envTablePdas, tableAddress])
 
   useEffect(() => {
     ;(async () => {
@@ -623,6 +673,32 @@ export default function Home() {
 
         <section className="card">
           <h2>Table</h2>
+          {hasEnvTableList && tableSelectOptions.length > 0 ? (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: 'block', marginBottom: 6 }}>Select table</label>
+              <select
+                value={tableSelectOptions.includes(tableAddress) ? tableAddress : tableSelectOptions[0]}
+                onChange={(e) => {
+                  const next = e.target.value.trim()
+                  setTableAddress(next)
+                  try {
+                    window.localStorage.setItem('selectedTablePda', next)
+                  } catch {}
+                }}
+                style={{ width: '100%' }}
+              >
+                {tableSelectOptions.map((pda) => (
+                  <option key={pda} value={pda}>
+                    {pda.slice(0, 4)}…{pda.slice(-4)}
+                  </option>
+                ))}
+              </select>
+              <div className="muted" style={{ fontSize: 13, marginTop: 6 }}>
+                Add/remove tables via NEXT_PUBLIC_TABLE_PDAS (comma-separated) in Render.
+              </div>
+            </div>
+          ) : null}
+
           {isFunctionalTokenOwner ? (
             <div className="row">
               <label className="row" style={{gap:8}}>
@@ -679,11 +755,11 @@ export default function Home() {
             <div style={{fontSize:13,color:'#666'}}>
               {tableAddress
                 ? `Table: configured (${tableAddress.slice(0, 4)}…${tableAddress.slice(-4)})`
-                : 'Table: not configured (operator must set NEXT_PUBLIC_TABLE_PDA or create a table)'}
+                : 'Table: not configured (operator must set NEXT_PUBLIC_TABLE_PDA / NEXT_PUBLIC_TABLE_PDAS, or create a table)'}
             </div>
 
             {/* For security + simplicity: show table address input only to owners/operators when not pinned */}
-            {!tableAddressIsPinned && isFunctionalTokenOwner ? (
+            {!tableAddressIsPinned && !hasEnvTableList && isFunctionalTokenOwner ? (
               <div style={{marginTop:10}}>
                 <label style={{display:'block',marginBottom:6}}>Table address (PDA) (owner only)</label>
                 <input

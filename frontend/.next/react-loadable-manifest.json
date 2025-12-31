@@ -1,8 +1,8 @@
 {
-  "index.tsx -> ../components/RouletteBoardFixed": {
-    "id": "index.tsx -> ../components/RouletteBoardFixed",
+  "pages\\index.tsx -> ../components/RouletteBoardFixed": {
+    "id": 423,
     "files": [
-      "static/chunks/components_RouletteBoardFixed_tsx.js"
+      "static/chunks/423.95d0b692f512ef21.js"
     ]
   }
 }

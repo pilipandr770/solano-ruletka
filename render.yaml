@@ -31,3 +31,7 @@ services:
       # Optional: pin a single table PDA so players never see/edit it.
       - key: NEXT_PUBLIC_TABLE_PDA
         sync: false
+
+      # Optional: allow users to switch between multiple tables (comma-separated list of PDAs).
+      - key: NEXT_PUBLIC_TABLE_PDAS
+        sync: false

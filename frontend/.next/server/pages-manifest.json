@@ -1,8 +1,1 @@
-{
-  "/_app": "pages/_app.js",
-  "/_error": "pages/_error.js",
-  "/_document": "pages/_document.js",
-  "/api/social-links": "pages/api/social-links.js",
-  "/get-tokens": "pages/get-tokens.js",
-  "/": "pages/index.js"
-}
+{"/_app":"pages/_app.js","/agb":"pages/agb.html","/admin":"pages/admin.html","/datenschutz":"pages/datenschutz.html","/api/social-links":"pages/api/social-links.js","/get-tokens":"pages/get-tokens.html","/impressum":"pages/impressum.html","/":"pages/index.html","/_error":"pages/_error.js","/_document":"pages/_document.js","/404":"pages/404.html"}
