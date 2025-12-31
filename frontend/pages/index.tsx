@@ -2,6 +2,7 @@
 import Head from 'next/head'
 import { PublicKey, Connection } from '@solana/web3.js'
 import * as anchor from '@coral-xyz/anchor'
+import { getAssociatedTokenAddressSync } from '@solana/spl-token'
 import anchorLib from '../lib/anchor'
 import dynamic from 'next/dynamic'
 import idl from '../idl/roulette_table.json'
@@ -536,6 +537,27 @@ export default function Home() {
         })
       }
 
+      // Preflight player USDC balance to avoid opaque Token Program errors.
+      // Note: ATA may be auto-created inside anchorLib.placeBet(), but balance will still be 0.
+      let playerUsdcUi = 0
+      try {
+        const playerUsdcAta = getAssociatedTokenAddressSync(usdcMintPk, player)
+        const bal = await provider.connection.getTokenAccountBalance(playerUsdcAta, 'confirmed')
+        playerUsdcUi = Number(bal.value.uiAmount || 0)
+      } catch {
+        playerUsdcUi = 0
+      }
+      const playerUsdcBase = Math.floor(playerUsdcUi * 1_000_000)
+      if (playerUsdcBase < stakeBase) {
+        return setUiNotice({
+          kind: 'error',
+          text:
+            `Insufficient USDC in your wallet. Have: ${playerUsdcUi} USDC. ` +
+            `Need: ${(stakeBase / 1e6).toFixed(6)} USDC. ` +
+            `Go to /get-tokens or ask the operator to send you test USDC.`,
+        })
+      }
+
       setUiNotice({ kind: 'info', text: 'Bet submitted. Waiting for randomness…' })
       const res = await anchorLib.placeBet(program, provider, { table, betKind, stake: stakeBase })
       setLastBetPda(res.betPda)
@@ -578,6 +600,35 @@ export default function Home() {
       if (!tableAddress) return setUiNotice({ kind: 'error', text: 'Set table address in the input above' })
       let table: PublicKey
       try { table = new PublicKey(tableAddress) } catch (err) { console.error('Invalid tableAddress', tableAddress, err); return setUiNotice({ kind: 'error', text: 'Invalid table address' }) }
+
+      // Preflight total stake vs player USDC balance
+      let totalStakeBase = 0
+      for (const b of betSlip) totalStakeBase += Math.round(Number(b.stake) * 1_000_000)
+      try {
+        const tableAcc: any = await (program.account as any).table.fetch(table)
+        const usdcMintPk = new PublicKey(tableAcc.usdcMint)
+        const playerUsdcAta = getAssociatedTokenAddressSync(usdcMintPk, player)
+        const bal = await provider.connection.getTokenAccountBalance(playerUsdcAta, 'confirmed')
+        const playerUsdcUi = Number(bal.value.uiAmount || 0)
+        const playerUsdcBase = Math.floor(playerUsdcUi * 1_000_000)
+        if (playerUsdcBase < totalStakeBase) {
+          return setUiNotice({
+            kind: 'error',
+            text:
+              `Insufficient USDC for slip. Have: ${playerUsdcUi} USDC. ` +
+              `Need total: ${(totalStakeBase / 1e6).toFixed(6)} USDC. ` +
+              `Go to /get-tokens or ask the operator to send you test USDC.`,
+          })
+        }
+      } catch {
+        return setUiNotice({
+          kind: 'error',
+          text:
+            `Could not read your USDC balance (ATA may be missing). ` +
+            `Try placing a single bet once (it will create ATA), then retry.`,
+        })
+      }
+
       setUiNotice({ kind: 'info', text: 'Submitting slip…' })
       for (const b of betSlip) {
         let betKind: any = null
