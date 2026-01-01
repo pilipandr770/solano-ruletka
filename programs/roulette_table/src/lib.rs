@@ -4,6 +4,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use anchor_lang::solana_program::{program::invoke, system_instruction};
+use anchor_lang::solana_program::hash::hashv;
 
 // ORAO VRF CPI
 use orao_solana_vrf::{
@@ -16,6 +17,14 @@ use orao_solana_vrf::{
 use std::str::FromStr;
 
 declare_id!("ErfuhJxxpHNKviT5LCnupGhSUbXpjfRThxikEgb94aDt");
+
+fn anchor_account_discriminator(account_name: &str) -> [u8; 8] {
+    let hash = hashv(&[b"account:", account_name.as_bytes()]);
+    let bytes = hash.to_bytes();
+    let mut discriminator = [0u8; 8];
+    discriminator.copy_from_slice(&bytes[..8]);
+    discriminator
+}
 
 pub const GOV_TOTAL_SUPPLY: u64 = 100;
 pub const OPERATOR_THRESHOLD: u64 = 51;
@@ -87,7 +96,7 @@ pub mod roulette_table {
     pub fn repair_global(ctx: Context<RepairGlobal>) -> Result<()> {
         // Must already be program-owned to be repairable.
         require_keys_eq!(
-            ctx.accounts.global_state.owner(),
+            *ctx.accounts.global_state.to_account_info().owner,
             crate::ID,
             RouletteError::InvalidGlobalStateOwner
         );
@@ -123,8 +132,9 @@ pub mod roulette_table {
         }
 
         // Write new discriminator + serialized struct.
-        let mut data = ctx.accounts.global_state.to_account_info().try_borrow_mut_data()?;
-        data[..8].copy_from_slice(&GlobalState::discriminator());
+        let global_state_info = ctx.accounts.global_state.to_account_info();
+        let mut data = global_state_info.try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&anchor_account_discriminator("GlobalState"));
 
         let gs = GlobalState {
             usdc_mint: ctx.accounts.usdc_mint.key(),
@@ -529,6 +539,7 @@ pub struct RepairGlobal<'info> {
         seeds = [b"global", usdc_mint.key().as_ref()],
         bump
     )]
+    /// CHECK: Program-owned GlobalState PDA; we validate `owner == crate::ID` and then rewrite/realloc its data.
     pub global_state: UncheckedAccount<'info>,
 
     #[account(

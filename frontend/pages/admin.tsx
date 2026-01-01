@@ -8,6 +8,19 @@ import SiteHeader from '../components/SiteHeader'
 import anchorLib from '../lib/anchor'
 import idl from '../idl/roulette_table.json'
 
+function sanitizeFirstPda(raw: string | undefined): string {
+  if (!raw) return ''
+  const first = raw.split(/[\s,]+/g).map((s) => s.trim()).filter(Boolean)[0]
+  if (!first) return ''
+  try {
+    // eslint-disable-next-line no-new
+    new PublicKey(first)
+    return first
+  } catch {
+    return ''
+  }
+}
+
 type SocialLinks = {
   website?: string
   twitter?: string
@@ -22,7 +35,7 @@ export default function Admin() {
   const [govBalanceEnvUi, setGovBalanceEnvUi] = useState(0)
   const [uiNotice, setUiNotice] = useState<string>('')
 
-  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
+  const [tableAddress, setTableAddress] = useState<string>(sanitizeFirstPda(process.env.NEXT_PUBLIC_TABLE_PDA) || '')
   const [isOperator, setIsOperator] = useState(false)
 
   const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL || 'https://api.devnet.solana.com'

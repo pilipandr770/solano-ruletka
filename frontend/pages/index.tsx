@@ -10,6 +10,19 @@ import SiteFooter from '../components/SiteFooter'
 import SiteHeader from '../components/SiteHeader'
 const RouletteBoard = dynamic(() => import('../components/RouletteBoardFixed'), { ssr: false })
 
+function sanitizeFirstPda(raw: string | undefined): string {
+  if (!raw) return ''
+  const first = raw.split(/[\s,]+/g).map((s) => s.trim()).filter(Boolean)[0]
+  if (!first) return ''
+  try {
+    // eslint-disable-next-line no-new
+    new PublicKey(first)
+    return first
+  } catch {
+    return ''
+  }
+}
+
 declare global {
   interface Window { solana?: any }
 }
@@ -123,7 +136,7 @@ export default function Home() {
   const [govBalanceEnvUi, setGovBalanceEnvUi] = useState(0)
 
   const envGovMint = process.env.NEXT_PUBLIC_GOV_MINT
-  const envTablePda = process.env.NEXT_PUBLIC_TABLE_PDA
+  const envTablePda = sanitizeFirstPda(process.env.NEXT_PUBLIC_TABLE_PDA)
   const envTablePdasRaw = process.env.NEXT_PUBLIC_TABLE_PDAS || ''
   const hasEnvTableList = Boolean(envTablePdasRaw.trim())
   const envTablePdas = useMemo(() => {
@@ -173,7 +186,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [publicKey?.toBase58(), envGovMint])
 
-  const [tableAddress, setTableAddress] = useState<string>(process.env.NEXT_PUBLIC_TABLE_PDA || '')
+  const [tableAddress, setTableAddress] = useState<string>(envTablePda || '')
 
   // If a table list is provided, default to saved selection (or first in list)
   useEffect(() => {
@@ -439,9 +452,11 @@ export default function Home() {
         }
 
         if (!cancelled) {
+          // Stop the infinite animation loop; VRF on devnet can take longer than our initial poll window.
+          setSpinPhase('idle')
           setUiNotice({
             kind: 'info',
-            text: 'Ждём подтверждение VRF… Это занимает 5–15 секунд. Если долго — попробуй ещё раз через пару секунд.',
+            text: 'Ждём подтверждение VRF… На devnet это иногда занимает 30–120 секунд. Подожди и нажми SPIN ещё раз, чтобы проверить готовность.',
           })
         }
       } catch (e) {

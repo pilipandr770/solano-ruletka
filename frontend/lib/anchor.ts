@@ -108,13 +108,17 @@ type DecodedTable = {
   paused: boolean
   usdcMint: PublicKey
   govMint: PublicKey
+  // NOTE: historical name kept for backward-compat; this is actually `table.global_state` on-chain.
   vaultUsdc: PublicKey
+  globalState: PublicKey
   controlVaultGov: PublicKey
   minBet: bigint
   maxBet: bigint
   lockedLiability: bigint
   activeBets: number
   betSeq: bigint
+  withdrawRequestTs: bigint
+  withdrawRequestAmount: bigint
 }
 
 function decodeTableAccount(data: Uint8Array): DecodedTable {
@@ -129,7 +133,7 @@ function decodeTableAccount(data: Uint8Array): DecodedTable {
 
   const usdcMint = readPubkey(data, o); o = usdcMint.next
   const govMint = readPubkey(data, o); o = govMint.next
-  const vaultUsdc = readPubkey(data, o); o = vaultUsdc.next
+  const globalState = readPubkey(data, o); o = globalState.next
   const controlVaultGov = readPubkey(data, o); o = controlVaultGov.next
 
   const minBet = readU64LE(data, o); o = minBet.next
@@ -139,6 +143,11 @@ function decodeTableAccount(data: Uint8Array): DecodedTable {
   const activeBets = readU32LE(data, o); o = activeBets.next
   const betSeq = readU64LE(data, o); o = betSeq.next
 
+  const withdrawRequestTs = readI64LE(data, o); o = withdrawRequestTs.next
+  const withdrawRequestAmount = readU64LE(data, o); o = withdrawRequestAmount.next
+
+  // bumps (u8,u8) exist but are not currently needed client-side
+
   return {
     seed: seed.value,
     creator: creator.value,
@@ -147,14 +156,23 @@ function decodeTableAccount(data: Uint8Array): DecodedTable {
     paused: paused.value,
     usdcMint: usdcMint.value,
     govMint: govMint.value,
-    vaultUsdc: vaultUsdc.value,
+    vaultUsdc: globalState.value,
+    globalState: globalState.value,
     controlVaultGov: controlVaultGov.value,
     minBet: minBet.value,
     maxBet: maxBet.value,
     lockedLiability: lockedLiability.value,
     activeBets: activeBets.value,
     betSeq: betSeq.value,
+    withdrawRequestTs: withdrawRequestTs.value,
+    withdrawRequestAmount: withdrawRequestAmount.value,
   }
+}
+
+async function fetchDecodedTable(provider: anchor.AnchorProvider, tablePk: PublicKey): Promise<DecodedTable> {
+  const info = await provider.connection.getAccountInfo(tablePk, 'confirmed')
+  if (!info?.data) throw new Error('Table account not found')
+  return decodeTableAccount(Uint8Array.from(info.data))
 }
 
 type DecodedBet = {
@@ -424,11 +442,17 @@ async function ensureGlobalInitialized(
         .repairGlobal()
         .accounts({
           payer,
+          // Support both camelCase and snake_case IDL names
           usdcMint,
+          usdc_mint: usdcMint as any,
           globalState,
+          global_state: globalState as any,
           globalVaultUsdc,
+          global_vault_usdc: globalVaultUsdc as any,
           systemProgram: SystemProgram.programId,
+          system_program: SystemProgram.programId as any,
           tokenProgram: TOKEN_PROGRAM_ID,
+          token_program: TOKEN_PROGRAM_ID as any,
           rent: anchor.web3.SYSVAR_RENT_PUBKEY,
         })
         .rpc()
@@ -441,10 +465,15 @@ async function ensureGlobalInitialized(
     .accounts({
       payer,
       usdcMint,
+      usdc_mint: usdcMint as any,
       globalState,
+      global_state: globalState as any,
       globalVaultUsdc,
+      global_vault_usdc: globalVaultUsdc as any,
       systemProgram: SystemProgram.programId,
+      system_program: SystemProgram.programId as any,
       tokenProgram: TOKEN_PROGRAM_ID,
+      token_program: TOKEN_PROGRAM_ID as any,
       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
     })
     .rpc()
@@ -526,29 +555,138 @@ export async function depositLiquidity(
 ) {
   const operator = provider.wallet.publicKey
 
-  const tableAcc: any = await (program.account as any).table.fetch(args.table)
-  const usdcMintPk = new PublicKey(tableAcc.usdcMint)
+  const tableAcc = await fetchDecodedTable(provider, args.table)
+  const usdcMintPk = tableAcc.usdcMint
   const operatorUsdcAta =
     args.operatorUsdcAta ?? getAssociatedTokenAddressSync(usdcMintPk, operator)
 
-  const govMintPk = new PublicKey(tableAcc.govMint)
+  const govMintPk = tableAcc.govMint
   const operatorGovAta =
     args.operatorGovAta ?? getAssociatedTokenAddressSync(govMintPk, operator)
 
+  // The table stores the exact global_state address used by the program.
+  // Ensure we are deriving/repairing the correct PDA for this table's USDC mint.
+  const derived = deriveGlobalStatePdas(program.programId, usdcMintPk)
+  if (!derived.globalState.equals(tableAcc.globalState)) {
+    throw new Error(
+      `Table.global_state mismatch. Table points to ${tableAcc.globalState.toBase58()} but derived PDA is ${derived.globalState.toBase58()}. Recreate the table with the correct USDC mint.`
+    )
+  }
+
   const { globalState, globalVaultUsdc } = await ensureGlobalInitialized(program, provider, usdcMintPk)
 
-  return program.methods
+  // Extra safety: if the global_state account on-chain is corrupted, surface details early.
+  const gsInfo = await provider.connection.getAccountInfo(globalState, 'confirmed')
+  if (!gsInfo?.data) {
+    throw new Error(`global_state account not found: ${globalState.toBase58()}`)
+  }
+  if (!gsInfo.owner.equals(program.programId)) {
+    throw new Error(
+      `global_state owner mismatch. global_state=${globalState.toBase58()} owner=${gsInfo.owner.toBase58()} expectedProgram=${program.programId.toBase58()}`
+    )
+  }
+  const gsData = Uint8Array.from(gsInfo.data)
+  if (!isGlobalStateAccount(gsData)) {
+    const first8 = Buffer.from(gsData.slice(0, 8)).toString('hex')
+    const expected = Buffer.from(sha256(new TextEncoder().encode('account:GlobalState')).slice(0, 8)).toString('hex')
+    throw new Error(
+      `global_state discriminator mismatch. global_state=${globalState.toBase58()} first8=${first8} expected=${expected} (try calling repair_global once for this USDC mint)`
+    )
+  }
+
+  const builder = program.methods
     .depositLiquidityUsdc(new anchor.BN(args.amount))
     .accounts({
       operator,
       operatorUsdcAta,
+      operator_usdc_ata: operatorUsdcAta as any,
       table: args.table,
       operatorGovAta,
+      operator_gov_ata: operatorGovAta as any,
       globalState,
+      global_state: globalState as any,
       globalVaultUsdc,
+      global_vault_usdc: globalVaultUsdc as any,
       tokenProgram: TOKEN_PROGRAM_ID,
+      token_program: TOKEN_PROGRAM_ID as any,
     })
-    .rpc()
+
+  // Build the instruction locally so we can see the *actual* account metas order.
+  // This helps diagnose cases where the wrong program-owned account is being passed as `global_state`.
+  const ix = await builder.instruction()
+  const idlIx = (program.idl as any)?.instructions?.find((i: any) => i?.name === 'deposit_liquidity_usdc')
+  const idlNames: string[] = Array.isArray(idlIx?.accounts) ? idlIx.accounts.map((a: any) => a?.name) : []
+  const debugKeys = ix.keys.map((k, idx) => ({
+    idx,
+    name: idlNames[idx] || '(unknown)',
+    pubkey: k.pubkey.toBase58(),
+    isSigner: k.isSigner,
+    isWritable: k.isWritable,
+  }))
+
+  try {
+    return await builder.rpc()
+  } catch (e: any) {
+    const msg = (e?.message || String(e) || '').toLowerCase()
+    const looksLikeDiscMismatch = msg.includes('accountdiscriminatormismatch') || msg.includes('discriminator did not match')
+    const mentionsGlobal = msg.includes('global_state') || msg.includes('globalstate')
+
+    // If the global_state PDA exists but has an old discriminator/layout, try an on-chain repair then retry once.
+    if (looksLikeDiscMismatch && mentionsGlobal) {
+      try {
+        await program.methods
+          .repairGlobal()
+          .accounts({
+            payer: operator,
+            usdcMint: usdcMintPk,
+            usdc_mint: usdcMintPk as any,
+            globalState,
+            global_state: globalState as any,
+            globalVaultUsdc,
+            global_vault_usdc: globalVaultUsdc as any,
+            systemProgram: SystemProgram.programId,
+            system_program: SystemProgram.programId as any,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID as any,
+            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          })
+          .rpc()
+
+        // Retry the original deposit after repair.
+        return await builder.rpc()
+      } catch (repairErr: any) {
+        const rmsg = (repairErr?.message || String(repairErr) || '')
+        console.error('repairGlobal failed during depositLiquidity retry:', repairErr)
+
+        // If the program doesn't even recognize the instruction, this means the deployed
+        // binary is older/different than our local IDL/source.
+        if (rmsg.includes('InstructionFallbackNotFound') || rmsg.includes('Fallback functions are not supported')) {
+          throw new Error(
+            `depositLiquidity failed because the deployed program rejects global_state as a GlobalState, and it also does NOT support repair_global. ` +
+            `This indicates NEXT_PUBLIC_PROGRAM_ID (${program.programId.toBase58()}) is not the same build/version as this repo's program/IDL. ` +
+            `Fix: redeploy the program from this repo (devnet) and update NEXT_PUBLIC_PROGRAM_ID, then create a fresh table and deposit liquidity again. ` +
+            `Original: ${e?.message || String(e)}; repairGlobal: ${rmsg}`
+          )
+        }
+
+        // fall through to detailed debug throw below
+      }
+    }
+
+    // Throw a more actionable error that includes the derived/expected keys and the actual instruction metas.
+    const details = {
+      table: args.table.toBase58(),
+      operator: operator.toBase58(),
+      operatorUsdcAta: operatorUsdcAta.toBase58(),
+      operatorGovAta: operatorGovAta.toBase58(),
+      globalState: globalState.toBase58(),
+      globalVaultUsdc: globalVaultUsdc.toBase58(),
+      instructionAccounts: debugKeys,
+      original: e?.message || String(e),
+    }
+    console.error('depositLiquidityUsdc failed (debug):', details)
+    throw new Error(`depositLiquidityUsdc failed. Debug: ${JSON.stringify(details)}`)
+  }
 }
 
 export async function executeWithdraw(
