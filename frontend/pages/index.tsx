@@ -444,7 +444,7 @@ export default function Home() {
             setSpinPhase('idle')
             setUiNotice({
               kind: 'success',
-              text: 'Случайность подтверждена (VRF). Нажми SPIN, чтобы открыть результат.',
+              text: 'Randomness confirmed (VRF). Press SPIN to reveal the result.',
             })
             return
           }
@@ -456,7 +456,7 @@ export default function Home() {
           setSpinPhase('idle')
           setUiNotice({
             kind: 'info',
-            text: 'Ждём подтверждение VRF… На devnet это иногда занимает 30–120 секунд. Подожди и нажми SPIN ещё раз, чтобы проверить готовность.',
+            text: 'Waiting for VRF confirmation… On devnet this can take 30–120 seconds. Please wait and press SPIN again to check readiness.',
           })
         }
       } catch (e) {
@@ -581,7 +581,7 @@ export default function Home() {
       setSpinPhase('waiting')
       setUiNotice({
         kind: 'info',
-        text: 'Ставка принята. Ждём подтверждение случайности (VRF)…',
+        text: 'Bet accepted. Waiting for randomness confirmation (VRF)…',
       })
     } catch (e: any) {
       console.error(e)
@@ -990,7 +990,7 @@ export default function Home() {
                   {uiNotice.text}
                 </div>
               )}
-              {lastResult && (
+              {spinPhase === 'revealed' && lastResult && (
                 <div style={{marginTop:10,fontSize:15,fontWeight:700}}>
                   {lastResult.win
                     ? `WIN: +${lastResult.payout} USDC`
@@ -1001,12 +1001,13 @@ export default function Home() {
           </div>
           <div className="notice notice-info">
             <p style={{margin:'0 0 12px 0',fontSize:14}}>
-              Сначала делаем ставку. Затем ORAO VRF подтверждает случайность (это защищает от подкрутки). Когда будет готово — нажми SPIN.
+              First, place a bet. Then ORAO VRF confirms the randomness (prevents manipulation). Once it’s ready, press SPIN.
             </p>
             <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
               <button disabled={!lastBetPda || !tableAddress || spinPhase === 'waiting' || spinPhase === 'spinning'} onClick={async ()=>{
                 try {
                   setUiNotice(null)
+                  setLastResult(null)
                   if (!publicKey) {
                     setUiNotice({ kind: 'error', text: 'Connect wallet first' })
                     return
@@ -1016,7 +1017,7 @@ export default function Home() {
                     return
                   }
                   const betPdaStr = lastBetPda?.trim()
-                  if (!betPdaStr) return setUiNotice({ kind: 'error', text: 'Сначала сделай ставку' })
+                  if (!betPdaStr) return setUiNotice({ kind: 'error', text: 'Place a bet first' })
                   const { program, provider } = await ensureProgram()
                   const table = new PublicKey(tableAddress)
                   const bet = new PublicKey(betPdaStr)
@@ -1026,7 +1027,7 @@ export default function Home() {
                   if (!spinReady) {
                     setSpinPhase('waiting')
                     setSpinningNumber(null)
-                    setUiNotice({ kind: 'info', text: 'Ждём подтверждение VRF…' })
+                    setUiNotice({ kind: 'info', text: 'Waiting for VRF confirmation…' })
                   }
                   
                   // Check if randomness is fulfilled (optional)
@@ -1148,9 +1149,9 @@ export default function Home() {
               }}>{spinReady ? 'SPIN' : (lastBetPda ? 'WAIT…' : 'SPIN')}</button>
             </div>
             <div style={{marginTop:8,fontSize:13,color:'#0c5460'}}>
-              {(!lastBetPda) && 'Шаг 1: сделай ставку. После этого появится ожидание VRF.'}
-              {(lastBetPda && !spinReady) && 'Шаг 2: идёт проверяемая генерация случайности (VRF). Это нужно для честной рулетки.'}
-              {(lastBetPda && spinReady) && 'Шаг 3: нажми SPIN, чтобы открыть результат и выплату.'}
+              {(!lastBetPda) && 'Step 1: place a bet. After that, VRF waiting will start.'}
+              {(lastBetPda && !spinReady) && 'Step 2: verifiable randomness generation (VRF) is in progress. This keeps the roulette fair.'}
+              {(lastBetPda && spinReady) && 'Step 3: press SPIN to reveal the result and payout.'}
             </div>
           </div>
         </section>

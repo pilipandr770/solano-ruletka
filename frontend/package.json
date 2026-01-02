@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "lint": "node -e \"console.log('Frontend lint is not configured. Use `npm run build` for type-checking.')\"",
+    "test": "node -e \"console.log('No frontend tests are configured for this package.')\""
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",

@@ -1,39 +1,42 @@
 const { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { createMint, getOrCreateAssociatedTokenAccount, mintTo, transfer } = require('@solana/spl-token');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 async function main() {
     const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
-    // Твой адрес
+    // Recipient wallet address
     const recipient = new PublicKey('EHEDoKHQ66Q4qioDUSQfaecuP9EFTWwUx4V8WA8EDEne');
 
-    // Загрузи keypair из C:\Users\ПК\.config\solana\id.json
-    const keypairPath = 'C:\\Users\\ПК\\.config\\solana\\id.json';
+    // Load the local Solana CLI keypair (~/.config/solana/id.json)
+    // Using os.homedir() avoids hard-coding a user name (and avoids embedding Cyrillic in the repo).
+    const keypairPath = path.join(os.homedir(), '.config', 'solana', 'id.json');
     const keypairData = JSON.parse(fs.readFileSync(keypairPath, 'utf8'));
     const payer = Keypair.fromSecretKey(new Uint8Array(keypairData));
 
     console.log('Payer:', payer.publicKey.toString());
 
-    // Проверь баланс SOL
+    // Check SOL balance
     const balance = await connection.getBalance(payer.publicKey);
     console.log('SOL balance:', balance / LAMPORTS_PER_SOL);
 
     if (balance < 0.1 * LAMPORTS_PER_SOL) {
-        console.log('Недостаточно SOL, airdrop...');
+        console.log('Not enough SOL, requesting airdrop...');
         await connection.confirmTransaction(await connection.requestAirdrop(payer.publicKey, 1 * LAMPORTS_PER_SOL));
     }
 
-    // Создай USDC mint
-    console.log('Создание USDC mint...');
+    // Create USDC mint
+    console.log('Creating USDC mint...');
     const usdcMint = await createMint(connection, payer, payer.publicKey, null, 6); // 6 decimals
     console.log('USDC Mint:', usdcMint.toString());
 
-    // Создай ATA для USDC на payer
+    // Create ATA for USDC (payer)
     const usdcAtaPayer = await getOrCreateAssociatedTokenAccount(connection, payer, usdcMint, payer.publicKey);
     console.log('USDC ATA Payer:', usdcAtaPayer.address.toString());
 
-    // Mint 1e9 USDC на payer
+    // Mint 1e9 USDC to payer
     await mintTo(connection, payer, usdcMint, usdcAtaPayer.address, payer, 1000000000n * 10n**6n);
     console.log('Minted 1e9 USDC to payer');
 
@@ -43,12 +46,12 @@ async function main() {
     await transfer(connection, payer, usdcAtaPayer.address, usdcAtaRecipient.address, payer, 1000000000n * 10n**6n);
     console.log('Transferred 1e9 USDC to recipient');
 
-    // Создай GOV mint
-    console.log('Создание GOV mint...');
+    // Create GOV mint
+    console.log('Creating GOV mint...');
     const govMint = await createMint(connection, payer, payer.publicKey, null, 0); // 0 decimals
     console.log('GOV Mint:', govMint.toString());
 
-    // Создай ATA для GOV на payer
+    // Create ATA for GOV (payer)
     const govAtaPayer = await getOrCreateAssociatedTokenAccount(connection, payer, govMint, payer.publicKey);
     console.log('GOV ATA Payer:', govAtaPayer.address.toString());
 
@@ -60,14 +63,14 @@ async function main() {
     await transfer(connection, payer, govAtaPayer.address, govAtaRecipient.address, payer, 100n);
     console.log('Transferred 100 GOV to recipient');
 
-    // Обнови .env.local
+    // Update .env.local
     const envPath = './.env.local';
     let envContent = fs.readFileSync(envPath, 'utf8');
     envContent = envContent.replace(/NEXT_PUBLIC_USDC_MINT=.*/, `NEXT_PUBLIC_USDC_MINT=${usdcMint.toString()}`);
     envContent = envContent.replace(/NEXT_PUBLIC_GOV_MINT=.*/, `NEXT_PUBLIC_GOV_MINT=${govMint.toString()}`);
     fs.writeFileSync(envPath, envContent);
 
-    console.log('Обновлен .env.local');
+    console.log('Updated .env.local');
 }
 
 main().catch(console.error);
